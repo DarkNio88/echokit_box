@@ -17,28 +17,28 @@ pub fn afe_config(afe_config: &mut esp_idf_svc::sys::esp_sr::afe_config_t) {
 
 pub fn start_audio_workers(
     out_i2s: I2S1,
-    sck: Gpio5,
-    din: Gpio6,
-    dout: Gpio7,
+    out_clk: Gpio14, // BCLK Amplificatore (MAX98357)
+    out_ws: Gpio46,  // LRC  Amplificatore (MAX98357)
+    dout: Gpio41,    // DIN  Amplificatore (MAX98357)
 
     in_i2s: I2S0,
-    ws: Gpio4,
-    bclk: Gpio15,
-    lrclk: Gpio16,
+    in_clk: Gpio2,   // SCK Microfono (INMP441)
+    in_ws: Gpio1,    // WS  Microfono (INMP441)
+    din: Gpio42,     // SD  Microfono (INMP441)
 
     rx: crate::audio::PlayerRx,
     tx: crate::audio::EventTx,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let worker = crate::audio::BoardsAudioWorker {
         out_i2s,
-        out_ws: lrclk.into(),
-        out_clk: bclk.into(),
+        out_ws: out_ws.into(),
+        out_clk: out_clk.into(),
         dout: dout.into(),
         out_mclk: None,
 
         in_i2s,
-        in_ws: ws.into(),
-        in_clk: sck.into(),
+        in_ws: in_ws.into(),
+        in_clk: in_clk.into(),
         din: din.into(),
         in_mclk: None,
     };
@@ -101,7 +101,7 @@ pub const DISPLAY_HEIGHT: usize = 240;
 
 static mut ESP_LCD_PANEL_HANDLE: esp_idf_svc::sys::esp_lcd_panel_handle_t = std::ptr::null_mut();
 
-pub fn init_spi(_spi: SPI3, mosi: Gpio10, clk: Gpio9) -> Result<(), EspError> {
+pub fn init_spi(_spi: SPI3, mosi: Gpio20, clk: Gpio19) -> Result<(), EspError> {
     use esp_idf_svc::hal::spi::Spi;
     use esp_idf_svc::sys::*;
     const GPIO_NUM_NC: i32 = -1;
@@ -116,7 +116,7 @@ pub fn init_spi(_spi: SPI3, mosi: Gpio10, clk: Gpio9) -> Result<(), EspError> {
     esp!(unsafe { spi_bus_initialize(SPI3::device(), &buscfg, spi_common_dma_t_SPI_DMA_CH_AUTO,) })
 }
 
-pub fn init_lcd(cs: Gpio14, dc: Gpio8, rst: Gpio18) -> Result<(), EspError> {
+pub fn init_lcd(cs: Gpio45, dc: Gpio47, rst: Gpio21) -> Result<(), EspError> {
     use esp_idf_svc::sys::*;
 
     ::log::info!("Install panel IO");
@@ -125,8 +125,8 @@ pub fn init_lcd(cs: Gpio14, dc: Gpio8, rst: Gpio18) -> Result<(), EspError> {
     io_config.cs_gpio_num = cs.pin();
     io_config.dc_gpio_num = dc.pin();
     io_config.spi_mode = 3;
-    io_config.pclk_hz = 40 * 1000 * 1000;
-    io_config.trans_queue_depth = 10;
+    io_config.pclk_hz = 10 * 1000 * 1000; // conservative default for ST7789
+    io_config.trans_queue_depth = 20;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     esp!(unsafe {
@@ -248,13 +248,13 @@ macro_rules! start_hal {
     ($peripherals:ident, $evt_tx:ident) => {{
         crate::boards::cube2::init_spi(
             $peripherals.spi3,
-            $peripherals.pins.gpio10,
-            $peripherals.pins.gpio9,
+            $peripherals.pins.gpio20,
+            $peripherals.pins.gpio19,
         )?;
         crate::boards::cube2::init_lcd(
-            $peripherals.pins.gpio14,
-            $peripherals.pins.gpio8,
-            $peripherals.pins.gpio18,
+            $peripherals.pins.gpio45,
+            $peripherals.pins.gpio47,
+            $peripherals.pins.gpio21,
         )?;
         #[cfg(feature = "i2c")]
         {
@@ -290,7 +290,7 @@ macro_rules! start_hal {
         }
     }
     let _backlight = {
-        let mut backlight = crate::boards::backlight_init($peripherals.pins.gpio13.into()).unwrap();
+        let mut backlight = crate::boards::backlight_init($peripherals.pins.gpio48.into()).unwrap();
         crate::boards::set_backlight(&mut backlight, 70).unwrap();
         backlight
     };};
@@ -301,13 +301,13 @@ macro_rules! start_audio_workers {
     ($peripherals:ident, $rx:expr, $evt_tx:expr, $tokio_rt:expr) => {{
         crate::boards::cube2::start_audio_workers(
             $peripherals.i2s1,
-            $peripherals.pins.gpio5,
-            $peripherals.pins.gpio6,
-            $peripherals.pins.gpio7,
+            $peripherals.pins.gpio14,
+            $peripherals.pins.gpio46,
+            $peripherals.pins.gpio41,
             $peripherals.i2s0,
-            $peripherals.pins.gpio4,
-            $peripherals.pins.gpio15,
-            $peripherals.pins.gpio16,
+            $peripherals.pins.gpio2,
+            $peripherals.pins.gpio1,
+            $peripherals.pins.gpio42,
             $rx,
             $evt_tx,
         )?;

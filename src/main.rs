@@ -266,14 +266,24 @@ fn main() -> anyhow::Result<()> {
 
         #[cfg(feature = "boards")]
         {
-            let dout = peripherals.pins.gpio7;
-            let bclk = peripherals.pins.gpio15;
-            let lrclk = peripherals.pins.gpio16;
+            // Assegna i pin corretti della tua board per l'altoparlante (MAX98357A)
+            let out_clk = peripherals.pins.gpio14; // Altoparlante BCLK
+            let out_ws  = peripherals.pins.gpio46; // Altoparlante LRC
+            let dout    = peripherals.pins.gpio41; // Altoparlante DIN
+
+            // Assegna i pin corretti della tua board per il microfono (INMP441)
+            let _in_clk  = peripherals.pins.gpio2; // Microfono SCK
+            let _in_ws   = peripherals.pins.gpio1; // Microfono WS
+            let _din     = peripherals.pins.gpio42;  // Microfono SD
+
+            // Assegna i pin corretti per i due pulsanti fisici
+            let _btn_pow  = peripherals.pins.gpio9; // Tasto Accensione
+            let _btn_wake = peripherals.pins.gpio3; // Tasto Sveglia
             audio::player_welcome(
                 peripherals.i2s0,
-                bclk.into(),
+                out_clk.into(),
                 dout.into(),
-                lrclk.into(),
+                out_ws.into(),
                 None,
                 None,
             );
@@ -417,7 +427,93 @@ fn main() -> anyhow::Result<()> {
 
     let server = server.unwrap();
 
-    crate::start_audio_workers!(peripherals, rx1, evt_tx.clone(), &b);
+    // 1. CHIAMATA DIRETTA AUDIO (board-specific signatures)
+    #[cfg(feature = "box")]
+    {
+        crate::boards::start_audio_workers(
+            peripherals.i2s0,
+            peripherals.pins.gpio21, // BCLK
+            peripherals.pins.gpio47, // DIN
+            peripherals.pins.gpio14, // DOUT
+            peripherals.pins.gpio13, // WS
+            rx1,
+            evt_tx.clone(),
+        )?;
+    }
+
+    #[cfg(all(feature = "boards", not(feature = "cube"), not(feature = "cube2")))]
+    {
+        crate::boards::start_audio_workers(
+            peripherals.i2s1,
+            peripherals.pins.gpio14, // out_clk (BCLK)
+            peripherals.pins.gpio46, // out_ws (LRC)
+            peripherals.pins.gpio41, // dout
+            peripherals.i2s0,
+            peripherals.pins.gpio2,  // in_clk (SCK)
+            peripherals.pins.gpio1,  // in_ws (WS)
+            peripherals.pins.gpio42, // din (SD)
+            rx1,
+            evt_tx.clone(),
+        )?;
+    }
+
+    #[cfg(feature = "cube")]
+    {
+        crate::boards::start_audio_workers(
+            peripherals.i2s1,
+            peripherals.pins.gpio5,
+            peripherals.pins.gpio6,
+            peripherals.pins.gpio7,
+            peripherals.i2s0,
+            peripherals.pins.gpio4,
+            peripherals.pins.gpio15,
+            peripherals.pins.gpio16,
+            rx1,
+            evt_tx.clone(),
+        )?;
+    }
+
+    #[cfg(feature = "cube2")]
+    {
+        crate::boards::start_audio_workers(
+            peripherals.i2s1,
+            peripherals.pins.gpio14,
+            peripherals.pins.gpio46,
+            peripherals.pins.gpio41,
+            peripherals.i2s0,
+            peripherals.pins.gpio2,
+            peripherals.pins.gpio1,
+            peripherals.pins.gpio42,
+            rx1,
+            evt_tx.clone(),
+        )?;
+    }
+
+    // 2. CHIAMATA DIRETTA PER I PULSANTI (board-specific signatures)
+    #[cfg(feature = "box")]
+    {
+        crate::boards::start_btn_worker(&b, peripherals.pins.gpio3, evt_tx.clone())?;
+    }
+
+    #[cfg(all(feature = "boards", not(feature = "cube"), not(feature = "cube2")))]
+    {
+        crate::boards::start_btn_worker(
+            &b,
+            peripherals.pins.gpio9,
+            peripherals.pins.gpio3,
+            evt_tx.clone(),
+        )?;
+    }
+
+    #[cfg(feature = "cube")]
+    {
+        crate::boards::start_btn_worker(&b, peripherals.pins.gpio10, peripherals.pins.gpio39, evt_tx.clone())?;
+    }
+
+    #[cfg(feature = "cube2")]
+    {
+        crate::boards::start_btn_worker(&b, peripherals.pins.gpio40, peripherals.pins.gpio39, evt_tx.clone())?;
+    }
 
     let ws_task = app::main_work(server, tx1, evt_rx, &mut framebuffer, &mut chat_ui);
 

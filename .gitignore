@@ -2,3 +2,6 @@
 /.embuild
 /target
 /Cargo.lock
+docker-run.log
+.gitignore
+docker-build.log
