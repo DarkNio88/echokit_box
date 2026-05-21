@@ -125,7 +125,7 @@ pub fn init_lcd(cs: Gpio45, dc: Gpio47, rst: Gpio21) -> Result<(), EspError> {
     io_config.cs_gpio_num = cs.pin();
     io_config.dc_gpio_num = dc.pin();
     io_config.spi_mode = 3;
-    io_config.pclk_hz = 10 * 1000 * 1000; // conservative default for ST7789
+    io_config.pclk_hz = 40 * 1000 * 1000; // conservative default for ST7789
     io_config.trans_queue_depth = 20;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
