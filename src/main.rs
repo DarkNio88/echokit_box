@@ -175,29 +175,117 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     let peripherals = esp_idf_svc::hal::prelude::Peripherals::take().unwrap();
+
+    // Early diagnostic: force backlight GPIO48 HIGH to power panel during startup.
+
+        log::info!("Early backlight diagnostic: forcing GPIO48 HIGH");
+        unsafe {
+            use esp_idf_svc::sys::*;
+            let bl_num = 48 as i32;
+            let _ = esp!(gpio_set_direction(bl_num, gpio_mode_t_GPIO_MODE_OUTPUT));
+            let _ = esp!(gpio_set_level(bl_num, 1));
+        }
     let sysloop = EspSystemEventLoop::take()?;
     let _fs = esp_idf_svc::io::vfs::MountedEventfs::mount(20)?;
     let partition = esp_idf_svc::nvs::EspDefaultNvsPartition::take()?;
     let nvs = esp_idf_svc::nvs::EspDefaultNvs::new(partition, "setting", true)?;
 
-    let mut setting = Setting::load_from_nvs(&nvs)?;
-    nvs.set_u8("state", 0).unwrap();
-
-    log::info!("SSID: {:?}", setting.ssid);
-    log::info!("PASS: {:?}", setting.pass);
-    log::info!("Server URL: {:?}", setting.server_url);
+    let setting = Setting::load_from_nvs(&nvs)?;
+    // Share Setting + NVS in a mutex so BLE handlers can modify NVS anytime
+    let setting = Arc::new(Mutex::new((setting, nvs)));
+    {
+        let s = setting.lock().unwrap();
+        s.1.set_u8("state", 0).unwrap();
+        log::info!("SSID: {:?}", s.0.ssid);
+        log::info!("PASS: {:?}", s.0.pass);
+        log::info!("Server URL: {:?}", s.0.server_url);
+    }
 
     log_heap();
 
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(64);
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
 
+    // track whether BLE server has been started to avoid double init
+    let mut bt_started = false;
+
     crate::start_hal!(peripherals, evt_tx);
+
+    // Restore display rotation saved in NVS (if any)
+    {
+        let s = setting.lock().unwrap();
+        match s.1.get_u8("disp_rot") {
+            Ok(opt) => {
+                let rotation = opt.unwrap_or(0);
+                #[cfg(feature = "esp32s3cam")]
+                if let Err(e) = crate::boards::esp32s3cam::set_rotation_state(rotation) {
+                    log::error!("Failed to apply saved rotation (esp32s3cam): {:?}", e);
+                } else {
+                    log::info!("Applied saved rotation {} (esp32s3cam)", rotation);
+                }
+
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                if let Err(e) = crate::boards::base::set_rotation_state(rotation) {
+                    log::error!("Failed to apply saved rotation (base): {:?}", e);
+                } else {
+                    log::info!("Applied saved rotation {} (base)", rotation);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to read display_rotation from NVS: {:?}", e);
+            }
+        }
+        // Restore saved MADCTL (raw 0x36) if present
+        match s.1.get_u8("madctl") {
+            Ok(opt) => {
+                if let Some(mad) = opt {
+                    #[cfg(feature = "esp32s3cam")]
+                    if let Err(e) = crate::boards::esp32s3cam::set_madctl(mad) {
+                        log::error!("Failed to apply saved MADCTL (esp32s3cam): {:?}", e);
+                    } else {
+                        log::info!("Applied saved MADCTL 0x{:02X} (esp32s3cam)", mad);
+                    }
+
+                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                    if let Err(e) = crate::boards::base::set_madctl(mad) {
+                        log::error!("Failed to apply saved MADCTL (base): {:?}", e);
+                    } else {
+                        log::info!("Applied saved MADCTL 0x{:02X} (base)", mad);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to read MADCTL from NVS: {:?}", e);
+            }
+        }
+
+        // Restore saved panel gap (gap_x, gap_y) if both keys exist
+        let gap_x_opt = s.1.get_i32("gap_x").ok().flatten();
+        let gap_y_opt = s.1.get_i32("gap_y").ok().flatten();
+        if let (Some(gx), Some(gy)) = (gap_x_opt, gap_y_opt) {
+            #[cfg(feature = "esp32s3cam")]
+            if let Err(e) = crate::boards::esp32s3cam::set_gap(gx, gy) {
+                log::error!("Failed to apply saved gap (esp32s3cam): {:?}", e);
+            } else {
+                log::info!("Applied saved gap {},{} (esp32s3cam)", gx, gy);
+            }
+
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            if let Err(e) = crate::boards::base::set_gap(gx, gy) {
+                log::error!("Failed to apply saved gap (base): {:?}", e);
+            } else {
+                log::info!("Applied saved gap {},{} (base)", gx, gy);
+            }
+        }
+    }
 
     let mut framebuffer = Box::new(boards::ui::DisplayBuffer::new(ui::ColorFormat::WHITE));
     framebuffer.flush()?;
 
-    crate::ui::display_gif(framebuffer.as_mut(), &setting.background_gif.0).unwrap();
+    {
+        let s = setting.lock().unwrap();
+        crate::ui::display_gif(framebuffer.as_mut(), &s.0.background_gif.0).unwrap();
+    }
 
     // Configures the button
     let mut button = esp_idf_svc::hal::gpio::PinDriver::input(peripherals.pins.gpio0)?;
@@ -210,7 +298,10 @@ fn main() -> anyhow::Result<()> {
 
     log_heap();
 
-    let mut chat_ui = boards::ui::new_chat_ui::<6>(framebuffer.as_mut(), &setting.avatar_gif.0)?;
+    let mut chat_ui = {
+        let s = setting.lock().unwrap();
+        boards::ui::new_chat_ui::<6>(framebuffer.as_mut(), &s.0.avatar_gif.0)?
+    };
 
     #[cfg(feature = "extra_server")]
     {
@@ -224,20 +315,22 @@ fn main() -> anyhow::Result<()> {
             if let app::Event::ServerUrl(url) = event {
                 log::info!("Received ServerUrl event: {}", url);
                 if !url.is_empty() {
-                    setting.server_url = url;
+                    let mut s = setting.lock().unwrap();
+                    s.0.server_url = url;
                 }
                 break;
             }
         }
 
         std::thread::sleep(std::time::Duration::from_millis(500));
-        chat_ui.set_text(format!("Server URL: {}\nContinuing...", setting.server_url));
+        let server_url_tmp = { let s = setting.lock().unwrap(); s.0.server_url.clone() };
+        chat_ui.set_text(format!("Server URL: {}\nContinuing...", server_url_tmp));
         chat_ui.render_to_target(framebuffer.as_mut())?;
         framebuffer.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(2000));
     }
 
-    let need_init = button.is_low() || setting.need_init();
+    let need_init = button.is_low() || { let s = setting.lock().unwrap(); s.0.need_init() };
 
     if need_init {
         // let mut config_ui = ui::new_config_ui(start_ui, "https://echokit.dev/setup/")?;
@@ -248,12 +341,16 @@ fn main() -> anyhow::Result<()> {
             "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
+        {
+            let mut s = setting.lock().unwrap();
+            s.0.background_gif.0.clear();
+            s.0.avatar_gif.0.clear();
+        }
 
-        setting.background_gif.0.clear();
-        setting.avatar_gif.0.clear();
-        let setting = Arc::new(Mutex::new((setting, nvs)));
-
-        bt::bt(&dev_id, setting.clone(), evt_tx).unwrap();
+        if !bt_started {
+            bt::bt(&dev_id, setting.clone(), evt_tx.clone()).unwrap();
+            bt_started = true;
+        }
         log_heap();
 
         let version = env!("CARGO_PKG_VERSION");
@@ -264,7 +361,7 @@ fn main() -> anyhow::Result<()> {
         config_ui.draw(framebuffer.as_mut())?;
         framebuffer.flush()?;
 
-        #[cfg(feature = "boards")]
+        #[cfg(all(feature = "boards", not(feature = "_no_default")))]
         {
             // Assegna i pin corretti della tua board per l'altoparlante (MAX98357A)
             let out_clk = peripherals.pins.gpio14; // Altoparlante BCLK
@@ -367,22 +464,21 @@ fn main() -> anyhow::Result<()> {
         unsafe { esp_idf_svc::sys::esp_restart() }
     }
 
-    unsafe {
-        audio::AFE_LINEAR_GAIN = setting.afe_linear_gain;
-        audio::AGC_TARGET_LEVEL_DBFS = setting.agc_target_level_dbfs;
-        audio::AGC_COMPRESSION_GAIN_DB = setting.agc_compression_gain_db;
+    {
+        let s = setting.lock().unwrap();
+        unsafe {
+            audio::AFE_LINEAR_GAIN = s.0.afe_linear_gain;
+            audio::AGC_TARGET_LEVEL_DBFS = s.0.agc_target_level_dbfs;
+            audio::AGC_COMPRESSION_GAIN_DB = s.0.agc_compression_gain_db;
+        }
     }
 
     chat_ui.set_state("Connecting to wifi...".to_string());
     chat_ui.render_to_target(framebuffer.as_mut())?;
     framebuffer.flush()?;
 
-    let _wifi = network::wifi(
-        &setting.ssid,
-        &setting.pass,
-        peripherals.modem,
-        sysloop.clone(),
-    );
+    let (ssid_clone, pass_clone) = { let s = setting.lock().unwrap(); (s.0.ssid.clone(), s.0.pass.clone()) };
+    let _wifi = network::wifi(&ssid_clone, &pass_clone, peripherals.modem, sysloop.clone());
     if _wifi.is_err() {
         chat_ui.set_state("Failed to connect to wifi".to_string());
         chat_ui.set_text("Press K0 to open settings".to_string());
@@ -390,7 +486,7 @@ fn main() -> anyhow::Result<()> {
         framebuffer.flush()?;
 
         b.block_on(button.wait_for_falling_edge()).unwrap();
-        nvs.set_u8("state", 1).unwrap();
+        setting.lock().unwrap().1.set_u8("state", 1).unwrap();
         unsafe { esp_idf_svc::sys::esp_restart() }
     }
 
@@ -403,6 +499,11 @@ fn main() -> anyhow::Result<()> {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
 
+    if !bt_started {
+        bt::bt(&dev_id, setting.clone(), evt_tx.clone()).unwrap();
+        bt_started = true;
+    }
+
     chat_ui.set_state("Connecting to server...".to_string());
     chat_ui.set_text("".to_string());
     chat_ui.render_to_target(framebuffer.as_mut())?;
@@ -411,17 +512,18 @@ fn main() -> anyhow::Result<()> {
     log_heap();
 
     chat_ui.set_state("Failed to connect to server".to_string());
+    let server_url_clone = { let s = setting.lock().unwrap(); s.0.server_url.clone() };
     chat_ui.set_text(format!(
         "Please check your server URL: {}\nPress K0 to open settings",
-        setting.server_url
+        server_url_clone
     ));
-    let server = b.block_on(ws::Server::new(dev_id, setting.server_url));
+    let server = b.block_on(ws::Server::new(dev_id, server_url_clone));
     if server.is_err() {
         log::info!("Failed to connect to server: {:?}", server.err());
         chat_ui.render_to_target(framebuffer.as_mut())?;
         framebuffer.flush()?;
         b.block_on(button.wait_for_falling_edge()).unwrap();
-        nvs.set_u8("state", 1).unwrap();
+        setting.lock().unwrap().1.set_u8("state", 1).unwrap();
         unsafe { esp_idf_svc::sys::esp_restart() }
     }
 
@@ -441,7 +543,7 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    #[cfg(all(feature = "boards", not(feature = "cube"), not(feature = "cube2")))]
+    #[cfg(all(feature = "boards", not(feature = "_no_default"), not(feature = "cube"), not(feature = "cube2")))]
     {
         crate::boards::start_audio_workers(
             peripherals.i2s1,
@@ -489,13 +591,29 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    #[cfg(feature = "esp32s3cam")]
+    {
+        crate::boards::start_audio_workers(
+            peripherals.i2s1,
+            peripherals.pins.gpio14,
+            peripherals.pins.gpio46,
+            peripherals.pins.gpio41,
+            peripherals.i2s0,
+            peripherals.pins.gpio2,
+            peripherals.pins.gpio1,
+            peripherals.pins.gpio42,
+            rx1,
+            evt_tx.clone(),
+        )?;
+    }
+
     // 2. CHIAMATA DIRETTA PER I PULSANTI (board-specific signatures)
     #[cfg(feature = "box")]
     {
         crate::boards::start_btn_worker(&b, peripherals.pins.gpio3, evt_tx.clone())?;
     }
 
-    #[cfg(all(feature = "boards", not(feature = "cube"), not(feature = "cube2")))]
+    #[cfg(all(feature = "boards", not(feature = "_no_default"), not(feature = "esp32s3cam"), not(feature = "cube"), not(feature = "cube2")))]
     {
         crate::boards::start_btn_worker(
             &b,
@@ -513,6 +631,13 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "cube2")]
     {
         crate::boards::start_btn_worker(&b, peripherals.pins.gpio40, peripherals.pins.gpio39, evt_tx.clone())?;
+    }
+
+    #[cfg(feature = "esp32s3cam")]
+    {
+        // gpio0 is consumed by the local `button` PinDriver in main.rs; do not call
+        // the board helper which would take ownership again and cause a move error.
+        // The main code already handles the button events using `button`.
     }
 
     let ws_task = app::main_work(server, tx1, evt_rx, &mut framebuffer, &mut chat_ui);

@@ -6,9 +6,13 @@ const SERVICE_ID: BleUuid = uuid128!("623fa3e2-631b-4f8f-a6e7-a7b09c03e7e0");
 const SSID_ID: BleUuid = uuid128!("1fda4d6e-2f14-42b0-96fa-453bed238375");
 const PASS_ID: BleUuid = uuid128!("a987ab18-a940-421a-a1d7-b94ee22bccbe");
 const SERVER_URL_ID: BleUuid = uuid128!("cef520a9-bcb5-4fc6-87f7-82804eee2b20");
+const OTA_ID: BleUuid = uuid128!("a0b1c2d3-e4f5-47ab-89cd-0123456789ab");
 const BACKGROUND_GIF_ID: BleUuid = uuid128!("d1f3b2c4-5e6f-4a7b-8c9d-0e1f2a3b4c5d");
 const AVATAR_GIF_ID: BleUuid = uuid128!("e2f4c3b5-6d7e-4f8a-9b0c-1f2e3d4c5b6a");
 const RESET_ID: BleUuid = uuid128!("f0e1d2c3-b4a5-6789-0abc-def123456789");
+const ROTATE_ID: BleUuid = uuid128!("d0c1b2a3-9f8e-7d6c-5b4a-3c2b1a0f9e8d");
+const MADCTL_ID: BleUuid = uuid128!("3a2b1c0d-9e8f-7d6c-5b4a-3c2b1a0f9e8e");
+const GAP_ID: BleUuid = uuid128!("4b3c2d1e-0f9e-8d7c-6b5a-4c3b2a190e0f");
 const AFE_LINEAR_GAIN_ID: BleUuid = uuid128!("a1b2c3d4-e5f6-4789-0abc-def123456789");
 const AGC_TARGET_LEVEL_ID: BleUuid = uuid128!("b2c3d4e5-f6a7-4890-1bcd-ef2345678901");
 const AGC_COMPRESSION_GAIN_ID: BleUuid = uuid128!("c3d4e5f6-a7b8-4901-2cde-f34567890123");
@@ -104,8 +108,8 @@ pub fn bt(
             }
         });
 
-    let setting = setting.clone();
-    let setting_ = setting.clone();
+    let setting_server_url_read = setting.clone();
+    let setting_server_url_write = setting.clone();
     let setting_gif = setting.clone();
     let setting_avatar = setting.clone();
     let setting_afe = setting.clone(); // Extra clone for AFE characteristics
@@ -118,8 +122,8 @@ pub fn bt(
         .lock()
         .on_read(move |c, _| {
             log::info!("Read from server URL characteristic");
-            let setting = setting.lock().unwrap();
-            c.set_value(setting.0.server_url.as_bytes());
+            let s = setting_server_url_read.lock().unwrap();
+            c.set_value(s.0.server_url.as_bytes());
         })
         .on_write(move |args| {
             log::info!(
@@ -129,16 +133,34 @@ pub fn bt(
             );
             if let Ok(new_server_url) = String::from_utf8(args.recv_data().to_vec()) {
                 log::info!("New server URL: {}", new_server_url);
-                let mut setting = setting_.lock().unwrap();
-                if let Err(e) = setting.1.set_str("server_url", &new_server_url) {
+                let mut s = setting_server_url_write.lock().unwrap();
+                if let Err(e) = s.1.set_str("server_url", &new_server_url) {
                     log::error!("Failed to save server URL to NVS: {:?}", e);
                 } else {
-                    setting.0.server_url = new_server_url;
+                    s.0.server_url = new_server_url;
                 }
             } else {
                 log::error!("Failed to parse new server URL from bytes.");
             }
         });
+
+    // OTA via URL characteristic: write an HTTPS URL to trigger OTA update
+    let ota_evt_tx = evt_tx.clone();
+    let ota_characteristic = service
+        .lock()
+        .create_characteristic(OTA_ID, NimbleProperties::WRITE);
+    ota_characteristic.lock().on_write(move |args| {
+        if let Ok(url) = String::from_utf8(args.recv_data().to_vec()) {
+            log::info!("OTA requested via BLE: {}", url);
+            if let Err(e) = ota_evt_tx.blocking_send(crate::app::Event::Ota(url.clone())) {
+                log::error!("Failed to enqueue OTA request: {:?}", e);
+                args.reject();
+            }
+        } else {
+            log::error!("Failed to parse OTA URL from bytes.");
+            args.reject();
+        }
+    });
 
     let background_gif_characteristic = service
         .lock()
@@ -198,18 +220,266 @@ pub fn bt(
         }
     });
 
+    let evt_tx_reset = evt_tx.clone();
+    let evt_tx_rotate = evt_tx.clone();
+    let setting_for_rotate = setting.clone();
+
     let reset_characteristic = service
         .lock()
         .create_characteristic(RESET_ID, NimbleProperties::WRITE);
     reset_characteristic.lock().on_write(move |args| {
         let reset_cmd = args.recv_data();
         if reset_cmd == b"RESET" {
-            evt_tx
+            evt_tx_reset
                 .blocking_send(crate::app::Event::Event(crate::app::Event::RESET))
                 .unwrap();
         } else {
             log::warn!("Invalid reset command received via BLE.");
         }
+    });
+
+    // Rotation characteristic: write 'LEFT' or 'RIGHT' to rotate display 90°,
+    // or write an ASCII number 0..3 to set rotation state directly.
+    let rotate_characteristic = service
+        .lock()
+        .create_characteristic(ROTATE_ID, NimbleProperties::WRITE);
+    rotate_characteristic.lock().on_write(move |args| {
+        let data = args.recv_data();
+        let mut rotated = false;
+
+        // Try parse as UTF-8 command first
+        if let Ok(s) = std::str::from_utf8(data) {
+            let cmd = s.trim();
+            if cmd.eq_ignore_ascii_case("LEFT") {
+                #[cfg(feature = "esp32s3cam")]
+                {
+                    match crate::boards::esp32s3cam::rotate_left() {
+                        Ok(()) => { log::info!("Display rotated LEFT via BLE (esp32s3cam)"); rotated = true; }
+                        Err(e) => log::error!("Failed to rotate LEFT (esp32s3cam): {:?}", e),
+                    }
+                }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                {
+                    match crate::boards::base::rotate_left() {
+                        Ok(()) => { log::info!("Display rotated LEFT via BLE"); rotated = true; }
+                        Err(e) => log::error!("Failed to rotate LEFT: {:?}", e),
+                    }
+                }
+            } else if cmd.eq_ignore_ascii_case("RIGHT") {
+                #[cfg(feature = "esp32s3cam")]
+                {
+                    match crate::boards::esp32s3cam::rotate_right() {
+                        Ok(()) => { log::info!("Display rotated RIGHT via BLE (esp32s3cam)"); rotated = true; }
+                        Err(e) => log::error!("Failed to rotate RIGHT (esp32s3cam): {:?}", e),
+                    }
+                }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                {
+                    match crate::boards::base::rotate_right() {
+                        Ok(()) => { log::info!("Display rotated RIGHT via BLE"); rotated = true; }
+                        Err(e) => log::error!("Failed to rotate RIGHT: {:?}", e),
+                    }
+                }
+            } else if let Ok(n) = cmd.parse::<u8>() {
+                if n < 4 {
+                    #[cfg(feature = "esp32s3cam")]
+                    match crate::boards::esp32s3cam::set_rotation_state(n) {
+                        Ok(()) => { log::info!("Display rotation set to {} via BLE (esp32s3cam)", n); rotated = true; }
+                        Err(e) => log::error!("Failed to set rotation state (esp32s3cam): {:?}", e),
+                    }
+                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                    match crate::boards::base::set_rotation_state(n) {
+                        Ok(()) => { log::info!("Display rotation set to {} via BLE", n); rotated = true; }
+                        Err(e) => log::error!("Failed to set rotation state: {:?}", e),
+                    }
+                } else {
+                    log::warn!("Rotation value out of range: {}", n);
+                    args.reject();
+                    return;
+                }
+            }
+        }
+
+        // If still not handled, accept single-byte raw commands (L/R or 0..3)
+        if !rotated && data.len() == 1 {
+            let b = data[0];
+            if b == b'L' || b == b'l' {
+                #[cfg(feature = "esp32s3cam")]
+                { let _ = crate::boards::esp32s3cam::rotate_left(); rotated = true; }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                { let _ = crate::boards::base::rotate_left(); rotated = true; }
+            } else if b == b'R' || b == b'r' {
+                #[cfg(feature = "esp32s3cam")]
+                { let _ = crate::boards::esp32s3cam::rotate_right(); rotated = true; }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                { let _ = crate::boards::base::rotate_right(); rotated = true; }
+            } else if b <= 3 {
+                let n = b as u8;
+                #[cfg(feature = "esp32s3cam")]
+                { let _ = crate::boards::esp32s3cam::set_rotation_state(n); rotated = true; }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                { let _ = crate::boards::base::set_rotation_state(n); rotated = true; }
+            }
+        }
+
+        if !rotated {
+            log::warn!("Invalid rotate command via BLE: {:?}", data);
+            args.reject();
+            return;
+        }
+
+        // Persist rotation state to NVS so it survives reboot
+        let new_state: u8 = {
+            #[cfg(feature = "esp32s3cam")]
+            {
+                crate::boards::esp32s3cam::get_rotation_state()
+            }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            {
+                crate::boards::base::get_rotation_state()
+            }
+            #[cfg(not(any(feature = "esp32s3cam", all(feature = "boards", not(feature = "_no_default")))))]
+            {
+                0u8
+            }
+        };
+        if let Ok(s) = setting_for_rotate.lock() {
+            if let Err(e) = s.1.set_u8("disp_rot", new_state) {
+                log::error!("Failed to save display_rotation to NVS: {:?}", e);
+            } else {
+                log::info!("Saved display_rotation {} to NVS", new_state);
+            }
+        }
+        let _ = evt_tx_rotate.blocking_send(crate::app::Event::Redraw);
+    });
+
+    // MADCTL setter: write a single byte (raw) or ASCII hex (e.g. "0x36") to try different MADCTL values
+    let evt_tx_madctl = evt_tx.clone();
+    let setting_madctl = setting.clone();
+    let madctl_characteristic = service
+        .lock()
+        .create_characteristic(MADCTL_ID, NimbleProperties::WRITE);
+    madctl_characteristic.lock().on_write(move |args| {
+        let data = args.recv_data();
+        // Accept raw single byte or ASCII hex
+        if data.len() == 1 {
+            let val = data[0];
+            let mut ok = false;
+            #[cfg(feature = "esp32s3cam")]
+            match crate::boards::esp32s3cam::set_madctl(val) {
+                Ok(()) => { log::info!("MADCTL set to 0x{:02X} (esp32s3cam)", val); ok = true; }
+                Err(e) => log::error!("Failed to set MADCTL (esp32s3cam): {:?}", e),
+            }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            match crate::boards::base::set_madctl(val) {
+                Ok(()) => { log::info!("MADCTL set to 0x{:02X} (base)", val); ok = true; }
+                Err(e) => log::error!("Failed to set MADCTL (base): {:?}", e),
+            }
+
+            if ok {
+                if let Ok(s) = setting_madctl.lock() {
+                    if let Err(e) = s.1.set_u8("madctl", val) {
+                        log::error!("Failed to save MADCTL to NVS: {:?}", e);
+                    } else {
+                        log::info!("Saved MADCTL 0x{:02X} to NVS", val);
+                    }
+                }
+                let _ = evt_tx_madctl.blocking_send(crate::app::Event::Redraw);
+            }
+            return;
+        }
+
+        if let Ok(s) = std::str::from_utf8(data) {
+            let s = s.trim();
+            let hex = s.strip_prefix("0x").unwrap_or(s);
+            if let Ok(val) = u8::from_str_radix(hex, 16) {
+                let mut ok = false;
+                #[cfg(feature = "esp32s3cam")]
+                match crate::boards::esp32s3cam::set_madctl(val) {
+                    Ok(()) => { log::info!("MADCTL set to 0x{:02X} (esp32s3cam)", val); ok = true; }
+                    Err(e) => log::error!("Failed to set MADCTL (esp32s3cam): {:?}", e),
+                }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                match crate::boards::base::set_madctl(val) {
+                    Ok(()) => { log::info!("MADCTL set to 0x{:02X} (base)", val); ok = true; }
+                    Err(e) => log::error!("Failed to set MADCTL (base): {:?}", e),
+                }
+
+                if ok {
+                    if let Ok(s) = setting_madctl.lock() {
+                        if let Err(e) = s.1.set_u8("madctl", val) {
+                            log::error!("Failed to save MADCTL to NVS: {:?}", e);
+                        } else {
+                            log::info!("Saved MADCTL 0x{:02X} to NVS", val);
+                        }
+                    }
+                    let _ = evt_tx_madctl.blocking_send(crate::app::Event::Redraw);
+                }
+                return;
+            }
+        }
+
+        log::warn!("MADCTL: unsupported payload, send one raw byte or ASCII hex like '0x36'");
+        args.reject();
+    });
+
+    // GAP setter: write "x,y" ASCII or two raw bytes [x,y] to set panel gap
+    let evt_tx_gap = evt_tx.clone();
+    let setting_gap = setting.clone();
+    let gap_characteristic = service.lock().create_characteristic(GAP_ID, NimbleProperties::WRITE);
+    gap_characteristic.lock().on_write(move |args| {
+        let data = args.recv_data();
+        if data.len() == 2 {
+            let x = data[0] as i32;
+            let y = data[1] as i32;
+            let mut ok = false;
+            #[cfg(feature = "esp32s3cam")]
+            match crate::boards::esp32s3cam::set_gap(x, y) {
+                Ok(()) => { log::info!("Set gap to {},{} (esp32s3cam)", x, y); ok = true; }
+                Err(e) => log::error!("Failed to set gap (esp32s3cam): {:?}", e),
+            }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            match crate::boards::base::set_gap(x, y) {
+                Ok(()) => { log::info!("Set gap to {},{} (base)", x, y); ok = true; }
+                Err(e) => log::error!("Failed to set gap (base): {:?}", e),
+            }
+
+            if ok {
+                if let Ok(s) = setting_gap.lock() {
+                    if let Err(e) = s.1.set_i32("gap_x", x) {
+                        log::error!("Failed to save gap_x to NVS: {:?}", e);
+                    }
+                    if let Err(e) = s.1.set_i32("gap_y", y) {
+                        log::error!("Failed to save gap_y to NVS: {:?}", e);
+                    }
+                    log::info!("Saved gap to NVS: {},{}", x, y);
+                }
+                let _ = evt_tx_gap.blocking_send(crate::app::Event::Redraw);
+            }
+            return;
+        }
+
+        if let Ok(s) = std::str::from_utf8(data) {
+            let parts: Vec<&str> = s.trim().split(',').collect();
+            if parts.len() == 2 {
+                if let (Ok(x), Ok(y)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
+                    #[cfg(feature = "esp32s3cam")]
+                    match crate::boards::esp32s3cam::set_gap(x, y) {
+                        Ok(()) => log::info!("Set gap to {},{} (esp32s3cam)", x, y),
+                        Err(e) => log::error!("Failed to set gap (esp32s3cam): {:?}", e),
+                    }
+                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                    match crate::boards::base::set_gap(x, y) {
+                        Ok(()) => log::info!("Set gap to {},{} (base)", x, y),
+                        Err(e) => log::error!("Failed to set gap (base): {:?}", e),
+                    }
+                    return;
+                }
+            }
+        }
+
+        log::warn!("GAP: unsupported payload, send two bytes [x,y] or ASCII 'x,y'");
+        args.reject();
     });
 
     // AFE linear gain characteristic

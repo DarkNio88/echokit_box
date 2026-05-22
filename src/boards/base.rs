@@ -100,6 +100,113 @@ pub const DISPLAY_WIDTH: usize = 240;
 pub const DISPLAY_HEIGHT: usize = 240;
 
 static mut ESP_LCD_PANEL_HANDLE: esp_idf_svc::sys::esp_lcd_panel_handle_t = std::ptr::null_mut();
+static mut ESP_LCD_PANEL_IO_HANDLE: esp_idf_svc::sys::esp_lcd_panel_io_handle_t = std::ptr::null_mut();
+
+// Rotation state: 0=0°, 1=90°, 2=180°, 3=270°
+static mut DISPLAY_ROTATION_STATE: u8 = 0;
+// Stored logical gap values (as set by user / NVS). We reapply these taking rotation into account.
+static mut PANEL_GAP_X: i32 = 0;
+static mut PANEL_GAP_Y: i32 = 0;
+
+unsafe fn apply_stored_gap() -> Result<(), esp_idf_svc::sys::EspError> {
+    use esp_idf_svc::sys::*;
+    if ESP_LCD_PANEL_HANDLE.is_null() {
+        ::log::warn!("apply_stored_gap: panel handle is null");
+        return Ok(());
+    }
+
+    // When axes are swapped by rotation (state 1 or 3), swap gap values
+    let swap = matches!(DISPLAY_ROTATION_STATE, 1 | 3);
+    let (applied_x, applied_y) = if swap {
+        (PANEL_GAP_Y, PANEL_GAP_X)
+    } else {
+        (PANEL_GAP_X, PANEL_GAP_Y)
+    };
+
+    ::log::info!("apply_stored_gap: applying gap x={}, y={} (swap={})", applied_x, applied_y, swap);
+    esp!(esp_lcd_panel_set_gap(ESP_LCD_PANEL_HANDLE, applied_x, applied_y))?;
+    Ok(())
+}
+
+/// Rotate the panel 90 degrees clockwise (to the right).
+pub fn rotate_right() -> Result<(), EspError> {
+    use esp_idf_svc::sys::*;
+    unsafe {
+        if ESP_LCD_PANEL_HANDLE.is_null() {
+            ::log::error!("rotate_right: panel handle is null");
+            return Ok(());
+        }
+
+        DISPLAY_ROTATION_STATE = (DISPLAY_ROTATION_STATE + 1) % 4;
+        apply_rotation_state(DISPLAY_ROTATION_STATE)?;
+        ::log::info!("rotate_right: rotation state now {}", DISPLAY_ROTATION_STATE);
+    }
+    Ok(())
+}
+
+/// Rotate the panel 90 degrees counter-clockwise (to the left).
+pub fn rotate_left() -> Result<(), EspError> {
+    use esp_idf_svc::sys::*;
+    unsafe {
+        if ESP_LCD_PANEL_HANDLE.is_null() {
+            ::log::error!("rotate_left: panel handle is null");
+            return Ok(());
+        }
+
+        DISPLAY_ROTATION_STATE = (DISPLAY_ROTATION_STATE + 3) % 4; // -1 mod 4
+        apply_rotation_state(DISPLAY_ROTATION_STATE)?;
+        ::log::info!("rotate_left: rotation state now {}", DISPLAY_ROTATION_STATE);
+    }
+    Ok(())
+}
+
+/// Return the current rotation state (0..3)
+pub fn get_rotation_state() -> u8 {
+    unsafe { DISPLAY_ROTATION_STATE }
+}
+
+/// Set rotation state directly (0..3) and apply it to the panel
+pub fn set_rotation_state(state: u8) -> Result<(), EspError> {
+    use esp_idf_svc::sys::*;
+    unsafe {
+        if ESP_LCD_PANEL_HANDLE.is_null() {
+            ::log::error!("set_rotation_state: panel handle is null");
+            return Ok(());
+        }
+        DISPLAY_ROTATION_STATE = state % 4;
+        apply_rotation_state(DISPLAY_ROTATION_STATE)?;
+        ::log::info!("set_rotation_state: rotation state now {}", DISPLAY_ROTATION_STATE);
+    }
+    Ok(())
+}
+
+unsafe fn apply_rotation_state(state: u8) -> Result<(), EspError> {
+    use esp_idf_svc::sys::*;
+    let panel = ESP_LCD_PANEL_HANDLE;
+
+    // Compute swap/mirror from state
+    // Alternate mapping to match panel MADCTL on some variants:
+    // state 0: swap=false, mx=false, my=false
+    // state 1 (90°): swap=true, mx=false, my=true
+    // state 2 (180°): swap=false, mx=true, my=true
+    // state 3 (270°): swap=true, mx=true, my=false
+    let swap = matches!(state, 1 | 3);
+    let mx = matches!(state, 2 | 3);
+    let my = matches!(state, 1 | 2);
+
+    ::log::info!("apply_rotation_state: state={} swap={} mx={} my={}", state, swap, mx, my);
+
+    // Apply using esp-lcd helper calls which update MADCTL internally
+    esp!(esp_lcd_panel_swap_xy(panel, swap))?;
+    esp!(esp_lcd_panel_mirror(panel, mx, my))?;
+
+    // Reapply stored gap values for current rotation
+    if let Err(e) = apply_stored_gap() {
+        ::log::warn!("apply_rotation_state: failed to reapply stored gap: {:?}", e);
+    }
+
+    Ok(())
+}
 
 // 📺 Inizializzazione SPI per lo schermo Xiaozhi (SDA=20, SCL=19)
 pub fn init_spi(_spi: SPI3, mosi: Gpio20, clk: Gpio19) -> Result<(), EspError> {
@@ -164,6 +271,9 @@ pub fn init_lcd(cs: Gpio45, dc: Gpio47, rst: Gpio21) -> Result<(), EspError> {
     esp!(unsafe {
         esp_lcd_new_panel_io_spi(spi_host_device_t_SPI3_HOST as _, &io_config, &mut panel_io)
     })?;
+    unsafe {
+        ESP_LCD_PANEL_IO_HANDLE = panel_io;
+    }
     ::log::info!("panel IO created");
 
     let mut panel_config = esp_lcd_panel_dev_config_t::default();
@@ -233,20 +343,111 @@ pub fn init_lcd(cs: Gpio45, dc: Gpio47, rst: Gpio21) -> Result<(), EspError> {
     Ok(())
 }
 
+/// Set raw MADCTL (0x36) byte on the panel IO (allows experimenting with orientation flags)
+pub fn set_madctl(mad: u8) -> Result<(), EspError> {
+    unsafe {
+        use esp_idf_svc::sys::*;
+        if ESP_LCD_PANEL_IO_HANDLE.is_null() {
+            ::log::error!("set_madctl: panel IO handle is null");
+            return Ok(());
+        }
+        let madctl: [u8; 1] = [mad];
+        esp!(esp_lcd_panel_io_tx_param(ESP_LCD_PANEL_IO_HANDLE, 0x36, madctl.as_ptr().cast(), madctl.len()))?;
+        if !ESP_LCD_PANEL_HANDLE.is_null() {
+            esp!(esp_lcd_panel_disp_on_off(ESP_LCD_PANEL_HANDLE, false))?;
+            {
+                use std::thread::sleep;
+                use std::time::Duration;
+                sleep(Duration::from_millis(50));
+            }
+            esp!(esp_lcd_panel_disp_on_off(ESP_LCD_PANEL_HANDLE, true))?;
+        }
+    }
+    Ok(())
+}
+
+/// Set panel XY gap (column/row offset). Useful to correct physical panel alignment.
+pub fn set_gap(x_gap: i32, y_gap: i32) -> Result<(), EspError> {
+    unsafe {
+        use esp_idf_svc::sys::*;
+        if ESP_LCD_PANEL_HANDLE.is_null() {
+            ::log::error!("set_gap: panel handle is null");
+            return Ok(());
+        }
+        // Store logical gap values and apply taking current rotation into account
+        PANEL_GAP_X = x_gap;
+        PANEL_GAP_Y = y_gap;
+        if let Err(e) = apply_stored_gap() {
+            ::log::warn!("set_gap: failed to apply stored gap: {:?}", e);
+        }
+
+        esp!(esp_lcd_panel_disp_on_off(ESP_LCD_PANEL_HANDLE, false))?;
+        {
+            use std::thread::sleep;
+            use std::time::Duration;
+            sleep(Duration::from_millis(50));
+        }
+        esp!(esp_lcd_panel_disp_on_off(ESP_LCD_PANEL_HANDLE, true))?;
+    }
+    Ok(())
+}
+
 pub fn flush_display(color_data: &[u8], x_start: i32, y_start: i32, x_end: i32, y_end: i32) -> i32 {
     unsafe {
-        let e = esp_idf_svc::sys::esp_lcd_panel_draw_bitmap(
-            ESP_LCD_PANEL_HANDLE,
-            x_start,
-            y_start,
-            x_end,
-            y_end,
-            color_data.as_ptr().cast(),
-        );
-        if e != 0 {
-            ::log::warn!("flush_display error: {}", e);
+        use esp_idf_svc::sys::*;
+
+        // Basic validation: ensure rectangle is valid
+        if x_start >= x_end || y_start >= y_end {
+            ::log::warn!(
+                "flush_display invalid rectangle: x_start={} x_end={} y_start={} y_end={}",
+                x_start,
+                x_end,
+                y_start,
+                y_end
+            );
+            return ESP_ERR_INVALID_ARG;
         }
-        e
+
+        let width = (x_end - x_start) as usize;
+        let height = (y_end - y_start) as usize;
+        let row_bytes = width * std::mem::size_of::<u16>();
+
+        // Allocate a DMA-capable temporary buffer for one row
+        let dma_ptr = heap_caps_malloc(row_bytes, MALLOC_CAP_DMA) as *mut u8;
+        if dma_ptr.is_null() {
+            ::log::warn!("flush_display: failed to allocate DMA buffer ({} bytes)", row_bytes);
+            return ESP_ERR_NO_MEM;
+        }
+
+        let mut last_e: i32 = 0;
+        for row in 0..height {
+            let src_offset = row * row_bytes;
+            std::ptr::copy_nonoverlapping(
+                color_data.as_ptr().add(src_offset),
+                dma_ptr.add(0),
+                row_bytes,
+            );
+
+            let y0 = y_start + row as i32;
+            let y1 = y0 + 1;
+
+            let e = esp_lcd_panel_draw_bitmap(
+                ESP_LCD_PANEL_HANDLE,
+                x_start,
+                y0,
+                x_end,
+                y1,
+                dma_ptr.cast(),
+            );
+            if e != 0 {
+                let rot = get_rotation_state();
+                ::log::warn!("flush_display draw_bitmap error at row {}: {} - coords x_start={}, y0={}, x_end={}, y1={}, width={}, height={}, rot={}", row, e, x_start, y0, x_end, y1, width, height, rot);
+            }
+            last_e = e;
+        }
+
+        heap_caps_free(dma_ptr.cast());
+        last_e
     }
 }
 
@@ -271,7 +472,7 @@ macro_rules! start_hal {
         // ST7789 240x240 variant. Initializing the expander will reconfigure those
         // pins for I2C and can break the display. Disable by default and enable
         // only for known variants that actually have the XL9555 present.
-        const ENABLE_XL9555: bool = false;
+        const ENABLE_XL9555: bool = true;
         if ENABLE_XL9555 {
             unsafe {
                 use esp_idf_svc::sys::hal_driver;
@@ -288,12 +489,15 @@ macro_rules! start_hal {
             ::log::info!("XL9555 init skipped (ENABLE_XL9555=false).\nIf your board uses XL9555 enable it in code.");
         }
 
-        // Gestione Retroilluminazione (BLK) agganciata al tuo GPIO 16 (fallback LEDC)
-        let _backlight = {
-            let mut backlight = crate::boards::backlight_init($peripherals.pins.gpio48.into()).unwrap();
-            crate::boards::set_backlight(&mut backlight, 20).unwrap();
-            backlight
-        };
+        // Gestione Retroilluminazione (BLK) agganciata al tuo GPIO 48 (wrapper PWM/GPIO)
+        let __bl_gpio_num = esp_idf_svc::hal::gpio::Pin::pin(&$peripherals.pins.gpio48);
+        let mut _backlight = crate::boards::PwmBacklight::new(
+            $peripherals.pins.gpio48.into(),
+            __bl_gpio_num,
+        );
+        if let Err(e) = _backlight.set(20) {
+            ::log::error!("PwmBacklight set failed: {:?}", e);
+        }
     }};
 }
 

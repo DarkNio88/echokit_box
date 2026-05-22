@@ -173,18 +173,43 @@ pub fn init_lcd(cs: Gpio45, dc: Gpio47, rst: Gpio21) -> Result<(), EspError> {
 
 pub fn flush_display(color_data: &[u8], x_start: i32, y_start: i32, x_end: i32, y_end: i32) -> i32 {
     unsafe {
-        let e = esp_idf_svc::sys::esp_lcd_panel_draw_bitmap(
-            ESP_LCD_PANEL_HANDLE,
-            x_start,
-            y_start,
-            x_end,
-            y_end,
-            color_data.as_ptr().cast(),
-        );
-        if e != 0 {
-            log::warn!("flush_display error: {}", e);
+        use esp_idf_svc::sys::*;
+
+        let width = (x_end - x_start) as usize;
+        let height = (y_end - y_start) as usize;
+        let row_bytes = width * std::mem::size_of::<u16>();
+
+        let dma_ptr = heap_caps_malloc(row_bytes, MALLOC_CAP_DMA) as *mut u8;
+        if dma_ptr.is_null() {
+            ::log::warn!("flush_display: failed to allocate DMA buffer ({} bytes)", row_bytes);
+            return ESP_ERR_NO_MEM;
         }
-        e
+
+        let mut last_e: i32 = 0;
+        for row in 0..height {
+            let src_offset = row * row_bytes;
+            std::ptr::copy_nonoverlapping(
+                color_data.as_ptr().add(src_offset),
+                dma_ptr.add(0),
+                row_bytes,
+            );
+
+            let e = esp_lcd_panel_draw_bitmap(
+                ESP_LCD_PANEL_HANDLE,
+                x_start,
+                y_start + row as i32,
+                x_end,
+                y_start + row as i32 + 1,
+                dma_ptr.cast(),
+            );
+            if e != 0 {
+                log::warn!("flush_display draw_bitmap error at row {}: {}", row, e);
+            }
+            last_e = e;
+        }
+
+        heap_caps_free(dma_ptr.cast());
+        last_e
     }
 }
 
@@ -285,15 +310,20 @@ macro_rules! start_hal {
                 8 * 1024,
                 1000,
             ) {
-                log::error!("Failed to initialize I2C: {:?}", e);
+                ::log::error!("Failed to initialize I2C: {:?}", e);
             }
         }
     }
-    let _backlight = {
-        let mut backlight = crate::boards::backlight_init($peripherals.pins.gpio48.into()).unwrap();
-        crate::boards::set_backlight(&mut backlight, 70).unwrap();
-        backlight
-    };};
+    let __bl_gpio_num = esp_idf_svc::hal::gpio::Pin::pin(&$peripherals.pins.gpio48);
+    let mut _backlight = crate::boards::PwmBacklight::new(
+        $peripherals.pins.gpio48.into(),
+        __bl_gpio_num,
+    );
+    if let Err(e) = _backlight.set(70) {
+        ::log::error!("PwmBacklight set failed: {:?}", e);
+    }
+    // Ensure backlight is powered; PwmBacklight already attempts GPIO fallback if needed.
+};
 }
 
 #[macro_export]

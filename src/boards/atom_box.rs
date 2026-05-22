@@ -557,8 +557,6 @@ pub mod ui {
             ChatUI::<N>::layout(bounding_box)
         };
         let state_style = PrimitiveStyleBuilder::new()
-            .stroke_color(ColorFormat::CSS_DARK_BLUE)
-            .stroke_width(1)
             .fill_color(ColorFormat::CSS_DARK_BLUE)
             .build();
 
@@ -566,8 +564,6 @@ pub mod ui {
         target.draw_iter(pixels)?;
 
         let content_style = PrimitiveStyleBuilder::new()
-            .stroke_color(ColorFormat::CSS_BLACK)
-            .stroke_width(5)
             .fill_color(ColorFormat::CSS_BLACK)
             .build();
         let pixels = crate::ui::get_background_pixels(target, content_area_box, content_style, 0.5);

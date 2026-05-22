@@ -29,6 +29,7 @@ _no_default = []
 box = ["_no_default", "voice_interrupt", "custom_ui"]
 cube = ["_no_default", "voice_interrupt"]
 cube2 = ["_no_default", "voice_interrupt"]
+esp32s3cam = ["_no_default", "voice_interrupt"]
 nfc_cube2 = ["cube2", "mfrc522", "exio"]
 
 mfrc522 = ["i2c", "dep:ndef", "extra_server"]

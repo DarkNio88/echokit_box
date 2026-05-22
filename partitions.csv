@@ -1,8 +1,12 @@
 # Name,     Type, SubType, Offset,   Size, Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap,,,,
 
-# nvs,      data, nvs,     ,        0x6000,
+# Partition table for OTA-enabled layout
+# Keep a large NVS area (2M) because the app stores big blobs (background/avatar GIFs)
 nvs,      data, nvs,     ,        2M,
 phy_init, data, phy,     ,        0x1000,
-factory,  app,  factory, ,        5M,
+# Two OTA app slots (split previous factory area into two OTA partitions)
+ota_0,    app,  ota_0,   ,        2.5M,
+ota_1,    app,  ota_1,   ,        2.5M,
+ota_data, data, ota,     ,        0x2000,
 model,    data, spiffs,  ,        3M,

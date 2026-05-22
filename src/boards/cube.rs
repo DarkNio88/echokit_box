@@ -173,18 +173,43 @@ pub fn init_lcd(cs: Gpio21, dc: Gpio40, rst: Gpio45) -> Result<(), EspError> {
 
 pub fn flush_display(color_data: &[u8], x_start: i32, y_start: i32, x_end: i32, y_end: i32) -> i32 {
     unsafe {
-        let e = esp_idf_svc::sys::esp_lcd_panel_draw_bitmap(
-            ESP_LCD_PANEL_HANDLE,
-            x_start + 80,
-            y_start,
-            x_end + 80,
-            y_end,
-            color_data.as_ptr().cast(),
-        );
-        if e != 0 {
-            log::warn!("flush_display error: {}", e);
+        use esp_idf_svc::sys::*;
+
+        let width = (x_end - x_start) as usize;
+        let height = (y_end - y_start) as usize;
+        let row_bytes = width * std::mem::size_of::<u16>();
+
+        let dma_ptr = heap_caps_malloc(row_bytes, MALLOC_CAP_DMA) as *mut u8;
+        if dma_ptr.is_null() {
+            ::log::warn!("flush_display: failed to allocate DMA buffer ({} bytes)", row_bytes);
+            return ESP_ERR_NO_MEM;
         }
-        e
+
+        let mut last_e: i32 = 0;
+        for row in 0..height {
+            let src_offset = row * row_bytes;
+            std::ptr::copy_nonoverlapping(
+                color_data.as_ptr().add(src_offset),
+                dma_ptr.add(0),
+                row_bytes,
+            );
+
+            let e = esp_lcd_panel_draw_bitmap(
+                ESP_LCD_PANEL_HANDLE,
+                x_start + 80,
+                y_start + row as i32,
+                x_end + 80,
+                y_start + row as i32 + 1,
+                dma_ptr.cast(),
+            );
+            if e != 0 {
+                log::warn!("flush_display draw_bitmap error at row {}: {}", row, e);
+            }
+            last_e = e;
+        }
+
+        heap_caps_free(dma_ptr.cast());
+        last_e
     }
 }
 

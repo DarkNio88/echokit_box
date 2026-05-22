@@ -36,6 +36,16 @@
                     </div>
 
                     <div class="card bg-base-100 border border-base-300">
+                        <div class="card-body py-3">
+                            <h3 class="card-title text-lg">Display Rotation</h3>
+                            <div class="flex gap-2 mt-2">
+                                <button class="btn btn-outline flex-1" id="rotateLeft">Ruota a sinistra (−90°)</button>
+                                <button class="btn btn-outline flex-1" id="rotateRight">Ruota a destra (+90°)</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card bg-base-100 border border-base-300">
                         <div class="card-body">
                             <h3 class="card-title text-lg" id="ssidTitle">WiFi (MUST be 2.4GHz)</h3>
                             <label class="form-control">
@@ -65,6 +75,22 @@
                                 <input type="text" id="serverUrlInput" placeholder="EchoKit server WebSocket URL"
                                     class="input input-bordered w-full">
                             </label>
+                        </div>
+                    </div>
+
+                    <div class="card bg-base-100 border border-base-300">
+                        <div class="card-body">
+                            <h3 class="card-title text-lg">OTA Update</h3>
+                            <label class="form-control">
+                                <div class="label">
+                                    <span class="label-text">Firmware URL (HTTPS)</span>
+                                </div>
+                                <input type="text" id="otaUrlInput" placeholder="https://example.com/echokit.bin"
+                                    class="input input-bordered w-full">
+                            </label>
+                            <div class="flex gap-2 mt-2">
+                                <button class="btn btn-primary flex-1" id="startOtaButton">Start OTA</button>
+                            </div>
                         </div>
                     </div>
 
@@ -183,6 +209,36 @@
                                         </button>
                                     </div>
                                 </div>
+                                
+                                <!-- Screen Tuning: MADCTL & GAP -->
+                                <div class="card bg-base-100 border border-base-300">
+                                    <div class="card-body py-4">
+                                        <h4 class="card-title text-base">Screen Tuning (MADCTL & GAP)</h4>
+                                        <label class="form-control mb-2">
+                                            <div class="label"><span class="label-text">MADCTL (hex, e.g. 0x60)</span></div>
+                                            <input type="text" id="madctlInput" placeholder="0x60"
+                                                class="input input-bordered w-full" />
+                                        </label>
+                                        <div class="flex gap-2 mb-2">
+                                            <button class="btn btn-sm btn-outline" id="applyMadctlBtn">Apply
+                                                MADCTL</button>
+                                        </div>
+
+                                        <label class="form-control mb-2">
+                                            <div class="label"><span class="label-text">Panel Gap X,Y (integers)</span>
+                                            </div>
+                                            <div class="flex gap-2">
+                                                <input type="number" id="gapXInput" class="input input-bordered w-1/2"
+                                                    value="0" />
+                                                <input type="number" id="gapYInput" class="input input-bordered w-1/2"
+                                                    value="0" />
+                                            </div>
+                                        </label>
+                                        <div class="flex gap-2">
+                                            <button class="btn btn-sm btn-outline" id="applyGapBtn">Apply GAP</button>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -217,9 +273,13 @@
         const SSID_ID = "1fda4d6e-2f14-42b0-96fa-453bed238375";
         const PASS_ID = "a987ab18-a940-421a-a1d7-b94ee22bccbe";
         const SERVER_URL_ID = "cef520a9-bcb5-4fc6-87f7-82804eee2b20";
+        const OTA_ID = "a0b1c2d3-e4f5-47ab-89cd-0123456789ab";
+        const MADCTL_ID = "3a2b1c0d-9e8f-7d6c-5b4a-3c2b1a0f9e8e";
+        const GAP_ID = "4b3c2d1e-0f9e-8d7c-6b5a-4c3b2a190e0f";
         const BACKGROUND_IMAGE_ID = "d1f3b2c4-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
         const AVATAR_IMAGE_ID = "e2f4c3b5-6d7e-4f8a-9b0c-1f2e3d4c5b6a";
         const RESET_ID = "f0e1d2c3-b4a5-6789-0abc-def123456789";
+        const ROTATE_ID = "d0c1b2a3-9f8e-7d6c-5b4a-3c2b1a0f9e8d";
         const AFE_LINEAR_GAIN_ID = "a1b2c3d4-e5f6-4789-0abc-def123456789";
         const AGC_TARGET_LEVEL_ID = "b2c3d4e5-f6a7-4890-1bcd-ef2345678901";
         const AGC_COMPRESSION_GAIN_ID = "c3d4e5f6-a7b8-4901-2cde-f34567890123";
@@ -243,6 +303,8 @@
         const ssidInput = document.getElementById('ssidInput');
         const passInput = document.getElementById('passInput');
         const serverUrlInput = document.getElementById('serverUrlInput');
+        const otaUrlInput = document.getElementById('otaUrlInput');
+        const startOtaButton = document.getElementById('startOtaButton');
         const ssidTitle = document.getElementById('ssidTitle');
         const passTitle = document.getElementById('passTitle');
         const urlTitle = document.getElementById('urlTitle');
@@ -255,6 +317,13 @@
         const avatarPreview = document.getElementById('avatarPreview');
         const avatarFileError = document.getElementById('avatarFileError');
         const writeAvatarButton = document.getElementById('writeAvatarButton');
+        const rotateLeftButton = document.getElementById('rotateLeft');
+        const rotateRightButton = document.getElementById('rotateRight');
+        const madctlInput = document.getElementById('madctlInput');
+        const applyMadctlBtn = document.getElementById('applyMadctlBtn');
+        const gapXInput = document.getElementById('gapXInput');
+        const gapYInput = document.getElementById('gapYInput');
+        const applyGapBtn = document.getElementById('applyGapBtn');
         const clearAvatarButton = document.getElementById('clearAvatarButton');
         const notificationToast = document.getElementById('notificationToast');
         const toastMessage = document.getElementById('toastMessage');
@@ -496,6 +565,12 @@
             afeLinearGainRange.disabled = false;
             agcTargetLevelRange.disabled = false;
             agcCompressionGainRange.disabled = false;
+            // Enable MADCTL/GAP controls
+            if (madctlInput) madctlInput.disabled = false;
+            if (applyMadctlBtn) applyMadctlBtn.disabled = false;
+            if (gapXInput) gapXInput.disabled = false;
+            if (gapYInput) gapYInput.disabled = false;
+            if (applyGapBtn) applyGapBtn.disabled = false;
         }
 
         // Disable all controls
@@ -520,6 +595,12 @@
             saveAfeLinearGainButton.disabled = true;
             saveAgcTargetLevelButton.disabled = true;
             saveAgcCompressionGainButton.disabled = true;
+            // Disable MADCTL/GAP controls
+            if (madctlInput) madctlInput.disabled = true;
+            if (applyMadctlBtn) applyMadctlBtn.disabled = true;
+            if (gapXInput) gapXInput.disabled = true;
+            if (gapYInput) gapYInput.disabled = true;
+            if (applyGapBtn) applyGapBtn.disabled = true;
         }
 
         // Reads Characteristic
@@ -871,6 +952,98 @@
                 showNotification('Error', 'Failed to clear avatar: ' + error.message, true);
             }
         });
+
+        // Rotate buttons: send 'LEFT' or 'RIGHT' to ROTATE characteristic
+        rotateLeftButton.addEventListener('click', async () => {
+            if (!isConnected || !service) {
+                showNotification('Error', 'Device not connected', true);
+                return;
+            }
+            try {
+                await writeCharacteristic(ROTATE_ID, 'LEFT');
+                showNotification('Success', 'Rotate LEFT command sent');
+            } catch (e) {
+                console.error('Rotate error:', e);
+                showNotification('Error', 'Rotate failed: ' + (e && e.message ? e.message : e), true);
+            }
+        });
+
+        rotateRightButton.addEventListener('click', async () => {
+            if (!isConnected || !service) {
+                showNotification('Error', 'Device not connected', true);
+                return;
+            }
+            try {
+                await writeCharacteristic(ROTATE_ID, 'RIGHT');
+                showNotification('Success', 'Rotate RIGHT command sent');
+            } catch (e) {
+                console.error('Rotate error:', e);
+                showNotification('Error', 'Rotate failed: ' + (e && e.message ? e.message : e), true);
+            }
+        });
+
+        // Start OTA button: write OTA URL to OTA characteristic
+        startOtaButton.addEventListener('click', async () => {
+            if (!isConnected || !service) {
+                showNotification('Error', 'Device not connected', true);
+                return;
+            }
+
+            const url = otaUrlInput.value || '';
+            if (!url) {
+                showNotification('Error', 'Please provide a firmware URL', true);
+                return;
+            }
+
+            try {
+                await writeCharacteristic(OTA_ID, url);
+                showNotification('Message', 'OTA URL sent; device will download and update if possible');
+            } catch (e) {
+                console.error('OTA error:', e);
+                showNotification('Error', 'OTA failed to start: ' + (e && e.message ? e.message : e), true);
+            }
+        });
+
+        // Apply MADCTL value (ASCII hex like '0x60' or decimal string)
+        if (applyMadctlBtn) {
+            applyMadctlBtn.addEventListener('click', async () => {
+                if (!isConnected || !service) {
+                    showNotification('Error', 'Device not connected', true);
+                    return;
+                }
+                const val = (madctlInput && madctlInput.value) ? madctlInput.value.trim() : '';
+                if (!val) {
+                    showNotification('Error', 'Please enter MADCTL value', true);
+                    return;
+                }
+                try {
+                    await writeCharacteristic(MADCTL_ID, val);
+                    showNotification('Success', `MADCTL applied: ${val}`);
+                } catch (e) {
+                    console.error('MADCTL error:', e);
+                    showNotification('Error', 'Failed to apply MADCTL: ' + (e && e.message ? e.message : e), true);
+                }
+            });
+        }
+
+        // Apply GAP (x,y) values
+        if (applyGapBtn) {
+            applyGapBtn.addEventListener('click', async () => {
+                if (!isConnected || !service) {
+                    showNotification('Error', 'Device not connected', true);
+                    return;
+                }
+                const x = gapXInput ? (gapXInput.value || '0') : '0';
+                const y = gapYInput ? (gapYInput.value || '0') : '0';
+                try {
+                    await writeCharacteristic(GAP_ID, `${x},${y}`);
+                    showNotification('Success', `GAP applied: ${x},${y}`);
+                } catch (e) {
+                    console.error('GAP error:', e);
+                    showNotification('Error', 'Failed to apply GAP: ' + (e && e.message ? e.message : e), true);
+                }
+            });
+        }
 
         // Read AFE Linear Gain (string format f32)
         async function readAfeLinearGain() {

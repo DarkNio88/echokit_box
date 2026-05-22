@@ -18,6 +18,16 @@ pub mod cube2;
 #[cfg(feature = "cube2")]
 pub use cube2::*;
 
+#[cfg(feature = "esp32s3cam")]
+pub mod esp32s3cam;
+#[cfg(feature = "esp32s3cam")]
+pub use esp32s3cam::*;
+
+#[cfg(feature = "esp32s3cam")]
+pub mod ws2812;
+#[cfg(feature = "esp32s3cam")]
+// ws2812 module available as `crate::boards::ws2812`
+
 #[cfg(feature = "i2c")]
 pub type I2CInitFn = fn(&mut esp_idf_svc::hal::i2c::I2cDriver<'static>) -> anyhow::Result<()>;
 #[cfg(feature = "i2c")]
@@ -193,14 +203,19 @@ pub fn backlight_init(
     bl_pin: esp_idf_svc::hal::gpio::AnyIOPin,
 ) -> anyhow::Result<esp_idf_svc::hal::ledc::LedcDriver<'static>> {
     use esp_idf_svc::hal;
+    log::info!("backlight_init: initializing LEDC timer/channel for backlight");
     let config = hal::ledc::config::TimerConfig::new()
         .resolution(hal::ledc::Resolution::Bits13)
         .frequency(hal::units::Hertz(5000));
-    let time = unsafe { hal::ledc::TIMER0::new() };
+    // Use TIMER1/CHANNEL1 for backlight to avoid colliding with other drivers
+    // that may use TIMER0/CHANNEL0 (e.g., camera LED or other LEDs).
+    let time = unsafe { hal::ledc::TIMER1::new() };
     let timer_driver = hal::ledc::LedcTimerDriver::new(time, &config)?;
 
     let ledc_driver =
-        hal::ledc::LedcDriver::new(unsafe { hal::ledc::CHANNEL0::new() }, timer_driver, bl_pin)?;
+        hal::ledc::LedcDriver::new(unsafe { hal::ledc::CHANNEL1::new() }, timer_driver, bl_pin)?;
+
+    log::info!("backlight_init: LEDC driver created");
 
     Ok(ledc_driver)
 }
@@ -214,8 +229,60 @@ pub fn set_backlight<'d>(
     let light = 100.min(light) as u32;
     let duty = LEDC_MAX_DUTY - (81 * (100 - light));
     let duty = if light == 0 { 0 } else { duty };
+    log::info!("set_backlight: setting duty {} (light={})", duty, light);
     ledc_driver.set_duty(duty)?;
+    // Some HAL implementations require an explicit update/apply step; attempt common methods if present.
+    // If the HAL provides an `update_duty` or similar it will be executed by `set_duty` internally.
     Ok(())
+}
+
+/// Wrapper that tries to use LEDC PWM and falls back to direct GPIO control.
+pub struct PwmBacklight {
+    ledc: Option<esp_idf_svc::hal::ledc::LedcDriver<'static>>,
+    gpio_num: i32,
+}
+
+impl PwmBacklight {
+    /// Create a new `PwmBacklight`. `bl_pin` will be consumed if LEDC init succeeds.
+    /// `gpio_num` is the raw GPIO number used for fallback GPIO control.
+    pub fn new(
+        bl_pin: esp_idf_svc::hal::gpio::AnyIOPin,
+        gpio_num: i32,
+    ) -> Self {
+        match backlight_init(bl_pin) {
+            Ok(ledc) => {
+                ::log::info!("PwmBacklight: LEDC driver created");
+                PwmBacklight {
+                    ledc: Some(ledc),
+                    gpio_num,
+                }
+            }
+            Err(e) => {
+                ::log::error!("PwmBacklight: LEDC init failed: {:?}", e);
+                // Try to power the backlight directly via GPIO as a best-effort fallback.
+                unsafe {
+                    use esp_idf_svc::sys::*;
+                    let _ = esp!(gpio_set_direction(gpio_num, gpio_mode_t_GPIO_MODE_OUTPUT));
+                    let _ = esp!(gpio_set_level(gpio_num, 1));
+                }
+                PwmBacklight { ledc: None, gpio_num }
+            }
+        }
+    }
+
+    /// Set brightness (0..=100). If LEDC is available, uses PWM; otherwise toggles GPIO (on/off).
+    pub fn set(&mut self, light: u8) -> anyhow::Result<()> {
+        if let Some(ledc) = &mut self.ledc {
+            set_backlight(ledc, light)?;
+        } else {
+            unsafe {
+                use esp_idf_svc::sys::*;
+                let _ = esp!(gpio_set_direction(self.gpio_num, gpio_mode_t_GPIO_MODE_OUTPUT));
+                let _ = esp!(gpio_set_level(self.gpio_num, if light == 0 { 0 } else { 1 }));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(feature = "custom_ui"))]
@@ -505,8 +572,6 @@ pub mod ui {
 
         let (state_area_box, content_area_box) = ChatUI::<N>::layout(bounding_box);
         let state_style = PrimitiveStyleBuilder::new()
-            .stroke_color(ColorFormat::CSS_DARK_BLUE)
-            .stroke_width(1)
             .fill_color(ColorFormat::CSS_DARK_BLUE)
             .build();
 
@@ -514,8 +579,6 @@ pub mod ui {
         target.draw_iter(pixels)?;
 
         let content_style = PrimitiveStyleBuilder::new()
-            .stroke_color(ColorFormat::CSS_BLACK)
-            .stroke_width(5)
             .fill_color(ColorFormat::CSS_BLACK)
             .build();
         let pixels = crate::ui::get_background_pixels(target, content_area_box, content_style, 0.5);

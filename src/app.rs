@@ -16,8 +16,11 @@ pub enum Event {
     MicAudioChunk(Vec<i16>),
     MicAudioEnd,
     Vowel(u8),
+    Redraw,
     #[cfg_attr(not(feature = "extra_server"), allow(unused))]
     ServerUrl(String),
+    // OTA via URL requested (handled in main_work)
+    Ota(String),
 }
 
 #[allow(unused)]
@@ -97,8 +100,14 @@ async fn select_evt(
                 Event::Vowel(v) => {
                     log::debug!("[Select] Received Vowel: {}", v);
                 }
+                Event::Redraw => {
+                    log::debug!("[Select] Received Redraw");
+                }
                 Event::ServerUrl(url) => {
                     log::info!("[Select] Received ServerUrl: {}", url);
+                }
+                Event::Ota(url) => {
+                    log::info!("[Select] Received Ota: {}", url);
                 }
             }
             Some(evt)
@@ -214,6 +223,12 @@ pub async fn main_work<'d, const N: usize>(
     while let Some(evt) = select_evt(&mut evt_rx, &mut server, &notify, wait_notify, timeout).await
     {
         match evt {
+            Event::Redraw => {
+                log::info!("Received Redraw event: re-rendering UI");
+                gui.render_to_target(framebuffer)?;
+                framebuffer.flush()?;
+                continue;
+            }
             Event::Event(Event::K0) => {
                 log::info!("Received event: k0");
 
@@ -299,6 +314,35 @@ pub async fn main_work<'d, const N: usize>(
                 framebuffer.flush()?;
             }
             Event::Event(Event::YES | Event::K1) => {}
+            Event::Event(Event::RESET) => {
+                log::info!("Received RESET event: restarting device");
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    unsafe { esp_idf_svc::sys::esp_restart() };
+                });
+            }
+
+            Event::Ota(url) => {
+                log::info!("Received OTA event: scheduling OTA for {}", url);
+                let url_clone = url.clone();
+                tokio::spawn(async move {
+                    log::info!("Starting OTA from URL: {}", url_clone);
+                    let res = tokio::task::spawn_blocking(move || crate::network::ota_update_from_url(&url_clone)).await;
+                    match res {
+                        Ok(Ok(())) => {
+                            log::info!("OTA succeeded; restarting device");
+                            unsafe { esp_idf_svc::sys::esp_restart() };
+                        }
+                        Ok(Err(e)) => {
+                            log::error!("OTA failed: {:?}", e);
+                        }
+                        Err(e) => {
+                            log::error!("OTA spawn error: {:?}", e);
+                        }
+                    }
+                });
+                continue;
+            }
             Event::Event(Event::IDLE) => {
                 log::info!("Received idle event");
                 if state == State::Listening {
