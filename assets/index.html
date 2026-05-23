@@ -224,6 +224,33 @@
                                     </div>
                                 </div>
 
+                                <!-- MADCTL Quick Test Panel -->
+                                <div class="card bg-base-100 border border-base-300 mt-4">
+                                    <div class="card-body">
+                                        <h4 class="card-title text-base">MADCTL Quick Test</h4>
+                                        <p class="text-sm text-muted mb-2">Click any value to send ASCII hex (e.g. <code>0x36</code>) to the device. Buttons send the string payload so the device will accept ASCII hex or single-byte raw depending on support.</p>
+
+                                        <div class="mb-2">
+                                            <div class="flex flex-wrap gap-2" id="madctlCommonPresets">
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x00">0x00</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x20">0x20</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x40">0x40</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x60">0x60</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x80">0x80</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0xA0">0xA0</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0xC0">0xC0</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0xE0">0xE0</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x08">BGR</button>
+                                                <button class="btn btn-xs btn-outline madctl-grid-btn" data-val="0x36">0x36</button>
+                                            </div>
+                                        </div>
+
+                                        <div class="overflow-auto">
+                                            <div id="madctlGrid" class="grid grid-cols-16 gap-1"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <!-- OTA Update via URL -->
                                 <div class="card bg-base-100 border border-base-300">
                                     <div class="card-body py-4">
@@ -570,6 +597,8 @@
             // Enable MADCTL/GAP/OTA controls
             if (madctlInput) madctlInput.disabled = false;
             if (applyMadctlBtn) applyMadctlBtn.disabled = false;
+            // enable MADCTL quick-test buttons
+            document.querySelectorAll('.madctl-grid-btn').forEach(b => b.disabled = false);
             if (gapXInput) gapXInput.disabled = false;
             if (gapYInput) gapYInput.disabled = false;
             if (applyGapBtn) applyGapBtn.disabled = false;
@@ -604,6 +633,8 @@
             // Disable MADCTL/GAP/OTA controls
             if (madctlInput) madctlInput.disabled = true;
             if (applyMadctlBtn) applyMadctlBtn.disabled = true;
+            // disable MADCTL quick-test buttons
+            document.querySelectorAll('.madctl-grid-btn').forEach(b => b.disabled = true);
             if (gapXInput) gapXInput.disabled = true;
             if (gapYInput) gapYInput.disabled = true;
             if (applyGapBtn) applyGapBtn.disabled = true;
@@ -1010,6 +1041,60 @@
                     showNotification('Error', 'Failed to apply MADCTL: ' + (e && e.message ? e.message : e), true);
                 }
             });
+        }
+
+        // MADCTL quick-grid utilities: generate 0x00..0xFF buttons and handlers
+        function hexPad(n) {
+            return n.toString(16).toUpperCase().padStart(2, '0');
+        }
+
+        async function sendMadctl(val) {
+            if (!isConnected || !service) {
+                showNotification('Error', 'Device not connected', true);
+                return;
+            }
+            try {
+                await writeCharacteristic(MADCTL_ID, val);
+                showNotification('Success', `MADCTL applied: ${val}`);
+            } catch (e) {
+                console.error('MADCTL quick send error:', e);
+                showNotification('Error', 'Failed to send MADCTL: ' + (e && e.message ? e.message : e), true);
+            }
+        }
+
+        function createMadctlGrid() {
+            const grid = document.getElementById('madctlGrid');
+            if (!grid) return;
+            grid.innerHTML = '';
+            for (let i = 0; i < 256; i++) {
+                const hex = hexPad(i);
+                const btn = document.createElement('button');
+                btn.classList.add('btn', 'btn-xs', 'btn-outline', 'madctl-grid-btn');
+                btn.style.minWidth = '54px';
+                btn.dataset.val = '0x' + hex;
+                btn.textContent = '0x' + hex;
+                btn.disabled = !isConnected;
+                btn.addEventListener('click', async (ev) => {
+                    const v = ev.currentTarget.dataset.val;
+                    await sendMadctl(v);
+                });
+                grid.appendChild(btn);
+            }
+
+            // Attach click handlers also to the common preset buttons (if present)
+            document.querySelectorAll('#madctlCommonPresets .madctl-grid-btn').forEach(p => {
+                p.addEventListener('click', async (ev) => {
+                    const v = ev.currentTarget.dataset.val;
+                    await sendMadctl(v);
+                });
+            });
+        }
+
+        // Build the grid on load
+        try {
+            createMadctlGrid();
+        } catch (e) {
+            console.warn('Failed to create MADCTL grid:', e);
         }
 
         // Apply GAP (x,y) values

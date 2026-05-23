@@ -19,8 +19,7 @@ pub enum Event {
     Redraw,
     #[cfg_attr(not(feature = "extra_server"), allow(unused))]
     ServerUrl(String),
-    // OTA via URL requested (handled in main_work)
-    Ota(String),
+    // OTA removed
 }
 
 #[allow(unused)]
@@ -105,9 +104,6 @@ async fn select_evt(
                 }
                 Event::ServerUrl(url) => {
                     log::info!("[Select] Received ServerUrl: {}", url);
-                }
-                Event::Ota(url) => {
-                    log::info!("[Select] Received Ota: {}", url);
                 }
             }
             Some(evt)
@@ -322,27 +318,7 @@ pub async fn main_work<'d, const N: usize>(
                 });
             }
 
-            Event::Ota(url) => {
-                log::info!("Received OTA event: scheduling OTA for {}", url);
-                let url_clone = url.clone();
-                tokio::spawn(async move {
-                    log::info!("Starting OTA from URL: {}", url_clone);
-                    let res = tokio::task::spawn_blocking(move || crate::network::ota_update_from_url(&url_clone)).await;
-                    match res {
-                        Ok(Ok(())) => {
-                            log::info!("OTA succeeded; restarting device");
-                            unsafe { esp_idf_svc::sys::esp_restart() };
-                        }
-                        Ok(Err(e)) => {
-                            log::error!("OTA failed: {:?}", e);
-                        }
-                        Err(e) => {
-                            log::error!("OTA spawn error: {:?}", e);
-                        }
-                    }
-                });
-                continue;
-            }
+            // OTA handling removed
             Event::Event(Event::IDLE) => {
                 log::info!("Received idle event");
                 if state == State::Listening {

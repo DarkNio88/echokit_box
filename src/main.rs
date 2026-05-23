@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use embedded_graphics::{
-    prelude::{Dimensions, RgbColor, WebColors},
-    Drawable,
-};
+// embedded_graphics imports not needed in main.rs
+use embedded_graphics::prelude::RgbColor;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 
 use crate::ui::DisplayTargetDrive;
+use crate::boards::ui::{DisplayBuffer, new_chat_ui};
 
 mod app;
 mod audio;
@@ -206,275 +205,117 @@ fn main() -> anyhow::Result<()> {
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(64);
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
 
-    // track whether BLE server has been started to avoid double init
-    let mut bt_started = false;
-
-    crate::start_hal!(peripherals, evt_tx);
-
-    // Restore display rotation saved in NVS (if any)
-    {
-        let s = setting.lock().unwrap();
-        match s.1.get_u8("disp_rot") {
-            Ok(opt) => {
-                let rotation = opt.unwrap_or(0);
-                #[cfg(feature = "esp32s3cam")]
-                if let Err(e) = crate::boards::esp32s3cam::set_rotation_state(rotation) {
-                    log::error!("Failed to apply saved rotation (esp32s3cam): {:?}", e);
-                } else {
-                    log::info!("Applied saved rotation {} (esp32s3cam)", rotation);
-                }
-
-                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
-                if let Err(e) = crate::boards::base::set_rotation_state(rotation) {
-                    log::error!("Failed to apply saved rotation (base): {:?}", e);
-                } else {
-                    log::info!("Applied saved rotation {} (base)", rotation);
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to read display_rotation from NVS: {:?}", e);
-            }
-        }
-        // Restore saved MADCTL (raw 0x36) if present
-        match s.1.get_u8("madctl") {
-            Ok(opt) => {
-                if let Some(mad) = opt {
-                    #[cfg(feature = "esp32s3cam")]
-                    if let Err(e) = crate::boards::esp32s3cam::set_madctl(mad) {
-                        log::error!("Failed to apply saved MADCTL (esp32s3cam): {:?}", e);
-                    } else {
-                        log::info!("Applied saved MADCTL 0x{:02X} (esp32s3cam)", mad);
-                    }
-
-                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
-                    if let Err(e) = crate::boards::base::set_madctl(mad) {
-                        log::error!("Failed to apply saved MADCTL (base): {:?}", e);
-                    } else {
-                        log::info!("Applied saved MADCTL 0x{:02X} (base)", mad);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to read MADCTL from NVS: {:?}", e);
-            }
-        }
-
-        // Restore saved panel gap (gap_x, gap_y) if both keys exist
-        let gap_x_opt = s.1.get_i32("gap_x").ok().flatten();
-        let gap_y_opt = s.1.get_i32("gap_y").ok().flatten();
-        if let (Some(gx), Some(gy)) = (gap_x_opt, gap_y_opt) {
-            #[cfg(feature = "esp32s3cam")]
-            if let Err(e) = crate::boards::esp32s3cam::set_gap(gx, gy) {
-                log::error!("Failed to apply saved gap (esp32s3cam): {:?}", e);
-            } else {
-                log::info!("Applied saved gap {},{} (esp32s3cam)", gx, gy);
-            }
-
-            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
-            if let Err(e) = crate::boards::base::set_gap(gx, gy) {
-                log::error!("Failed to apply saved gap (base): {:?}", e);
-            } else {
-                log::info!("Applied saved gap {},{} (base)", gx, gy);
-            }
-        }
-    }
-
-    let mut framebuffer = Box::new(boards::ui::DisplayBuffer::new(ui::ColorFormat::WHITE));
-    framebuffer.flush()?;
-
-    {
-        let s = setting.lock().unwrap();
-        crate::ui::display_gif(framebuffer.as_mut(), &s.0.background_gif.0).unwrap();
-    }
-
-    // Configures the button
-    let mut button = esp_idf_svc::hal::gpio::PinDriver::input(peripherals.pins.gpio0)?;
-    button.set_pull(esp_idf_svc::hal::gpio::Pull::Up)?;
-    button.set_interrupt_type(esp_idf_svc::hal::gpio::InterruptType::AnyEdge)?;
-
+    // (HTTP server on :8080 removed — we start the main HTTP server after Wi‑Fi)
+    // Small current-thread runtime used by main for blocking async helpers (ws, button waits)
     let b = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .expect("failed to build main current-thread runtime");
 
-    log_heap();
+    // Initialize board HAL (SPI + LCD) before attempting any framebuffer flushes.
+    // This ensures ESP_LCD_PANEL_HANDLE is set and `flush_display` won't return 258.
+    #[cfg(feature = "esp32s3cam")]
+    {
+        if let Err(e) = crate::boards::esp32s3cam::init_spi(
+            peripherals.spi3,
+            peripherals.pins.gpio20,
+            peripherals.pins.gpio19,
+        ) {
+            log::error!("Failed to init SPI for display: {:?}", e);
+        }
+        if let Err(e) = crate::boards::esp32s3cam::init_lcd(
+            peripherals.pins.gpio45,
+            peripherals.pins.gpio47,
+            peripherals.pins.gpio21,
+        ) {
+            log::error!("Failed to init LCD: {:?}", e);
+        }
+    }
 
-    let mut chat_ui = {
-        let s = setting.lock().unwrap();
-        boards::ui::new_chat_ui::<6>(framebuffer.as_mut(), &s.0.avatar_gif.0)?
+    #[cfg(all(feature = "boards", not(feature = "esp32s3cam")))]
+    {
+        if let Err(e) = crate::boards::base::init_spi(
+            peripherals.spi3,
+            peripherals.pins.gpio20,
+            peripherals.pins.gpio19,
+        ) {
+            log::error!("Failed to init SPI for display (base): {:?}", e);
+        }
+        if let Err(e) = crate::boards::base::init_lcd(
+            peripherals.pins.gpio45,
+            peripherals.pins.gpio47,
+            peripherals.pins.gpio21,
+        ) {
+            log::error!("Failed to init LCD (base): {:?}", e);
+        }
+    }
+
+    // Create display framebuffer and UI
+    let mut framebuffer = Box::new(DisplayBuffer::new(crate::ui::ColorFormat::BLACK));
+    let avatar_gif: Vec<u8> = { let s = setting.lock().unwrap(); s.0.avatar_gif.0.clone() };
+    let mut chat_ui = new_chat_ui::<4>(framebuffer.as_mut(), &avatar_gif)?;
+
+    // Restore display-related NVS settings (MADCTL, GAP, ROTATION) before first flush.
+    {
+        let (saved_madctl, saved_gap_x, saved_gap_y, saved_rot) = {
+            let s = setting.lock().unwrap();
+            let mad = s.1.get_u8("madctl").ok().flatten();
+            let gx = s.1.get_i32("gap_x").ok().flatten();
+            let gy = s.1.get_i32("gap_y").ok().flatten();
+            let rot = s.1.get_u8("disp_rot").ok().flatten();
+            (mad, gx, gy, rot)
+        };
+
+        if let Some(m) = saved_madctl {
+            #[cfg(feature = "esp32s3cam")]
+            if let Err(e) = crate::boards::esp32s3cam::set_madctl(m) { log::error!("Failed to restore MADCTL: {:?}", e); }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            if let Err(e) = crate::boards::base::set_madctl(m) { log::error!("Failed to restore MADCTL: {:?}", e); }
+            log::info!("Restored MADCTL from NVS: 0x{:02X}", m);
+        }
+
+        if saved_gap_x.is_some() || saved_gap_y.is_some() {
+            let gx = saved_gap_x.unwrap_or(0);
+            let gy = saved_gap_y.unwrap_or(0);
+            #[cfg(feature = "esp32s3cam")]
+            if let Err(e) = crate::boards::esp32s3cam::set_gap(gx, gy) { log::error!("Failed to restore gap: {:?}", e); }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            if let Err(e) = crate::boards::base::set_gap(gx, gy) { log::error!("Failed to restore gap: {:?}", e); }
+            log::info!("Restored GAP from NVS: x={}, y={}", gx, gy);
+        } else if let Some(rot) = saved_rot {
+            // If no explicit gap stored but rotation is 1 we prefer an initial adjustment
+            if rot == 1 {
+                // For rotation==1 apply a default gap mapping that yields a visible Y offset on rotated panel
+                #[cfg(feature = "esp32s3cam")]
+                if let Err(e) = crate::boards::esp32s3cam::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
+                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                if let Err(e) = crate::boards::base::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
+                log::info!("Applied default GAP for rot=1: x=80, y=0 (maps to Y=80 when swapped)");
+            }
+        }
+
+        if let Some(rot) = saved_rot {
+            #[cfg(feature = "esp32s3cam")]
+            if let Err(e) = crate::boards::esp32s3cam::set_rotation_state(rot) { log::error!("Failed to restore rotation: {:?}", e); }
+            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+            if let Err(e) = crate::boards::base::set_rotation_state(rot) { log::error!("Failed to restore rotation: {:?}", e); }
+            log::info!("Restored rotation state from NVS: {}", rot);
+        }
+    }
+
+    // Single-button pin used on some boards (esp32s3cam). Create only when feature enabled.
+    #[cfg(feature = "esp32s3cam")]
+    let mut button = {
+        let pin = peripherals.pins.gpio0;
+        let mut pin_dr = esp_idf_svc::hal::gpio::PinDriver::input(pin)?;
+        pin_dr.set_pull(esp_idf_svc::hal::gpio::Pull::Up)?;
+        pin_dr.set_interrupt_type(esp_idf_svc::hal::gpio::InterruptType::NegEdge)?;
+        pin_dr
     };
 
-    #[cfg(feature = "extra_server")]
-    {
-        chat_ui.set_state("Initializing...".to_string());
-        chat_ui.set_text("Loading Server URL...".to_string());
+    // Track whether BLE server has been started
+    let mut bt_started = false;
 
-        chat_ui.render_to_target(framebuffer.as_mut())?;
-        framebuffer.flush()?;
-
-        while let Some(event) = evt_rx.blocking_recv() {
-            if let app::Event::ServerUrl(url) = event {
-                log::info!("Received ServerUrl event: {}", url);
-                if !url.is_empty() {
-                    let mut s = setting.lock().unwrap();
-                    s.0.server_url = url;
-                }
-                break;
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let server_url_tmp = { let s = setting.lock().unwrap(); s.0.server_url.clone() };
-        chat_ui.set_text(format!("Server URL: {}\nContinuing...", server_url_tmp));
-        chat_ui.render_to_target(framebuffer.as_mut())?;
-        framebuffer.flush()?;
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-    }
-
-    let need_init = button.is_low() || { let s = setting.lock().unwrap(); s.0.need_init() };
-
-    if need_init {
-        // let mut config_ui = ui::new_config_ui(start_ui, "https://echokit.dev/setup/")?;
-
-        let esp_wifi = esp_idf_svc::wifi::EspWifi::new(peripherals.modem, sysloop, None)?;
-        let mac = esp_wifi.sta_netif().get_mac()?;
-        let dev_id = format!(
-            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
-        {
-            let mut s = setting.lock().unwrap();
-            s.0.background_gif.0.clear();
-            s.0.avatar_gif.0.clear();
-        }
-
-        if !bt_started {
-            bt::bt(&dev_id, setting.clone(), evt_tx.clone()).unwrap();
-            bt_started = true;
-        }
-        log_heap();
-
-        let version = env!("CARGO_PKG_VERSION");
-
-        framebuffer.fill_color(ui::ColorFormat::CSS_GRAY)?;
-        let mut config_ui = boards::ui::ConfiguresUI::new(framebuffer.bounding_box(), "https://echokit.dev/setup/", format!("Goto https://echokit.dev/setup/ to set up the device.\nDevice Name: EchoKit-{}\nVersion: {}", dev_id, version)).unwrap();
-
-        config_ui.draw(framebuffer.as_mut())?;
-        framebuffer.flush()?;
-
-        #[cfg(all(feature = "boards", not(feature = "_no_default")))]
-        {
-            // Assegna i pin corretti della tua board per l'altoparlante (MAX98357A)
-            let out_clk = peripherals.pins.gpio14; // Altoparlante BCLK
-            let out_ws  = peripherals.pins.gpio46; // Altoparlante LRC
-            let dout    = peripherals.pins.gpio41; // Altoparlante DIN
-
-            // Assegna i pin corretti della tua board per il microfono (INMP441)
-            let _in_clk  = peripherals.pins.gpio2; // Microfono SCK
-            let _in_ws   = peripherals.pins.gpio1; // Microfono WS
-            let _din     = peripherals.pins.gpio42;  // Microfono SD
-
-            // Assegna i pin corretti per i due pulsanti fisici
-            let _btn_pow  = peripherals.pins.gpio9; // Tasto Accensione
-            let _btn_wake = peripherals.pins.gpio3; // Tasto Sveglia
-            audio::player_welcome(
-                peripherals.i2s0,
-                out_clk.into(),
-                dout.into(),
-                out_ws.into(),
-                None,
-                None,
-            );
-        }
-
-        b.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-            tokio::select! {
-                _ = button.wait_for_falling_edge() =>{
-                    log::info!("Button k0 pressed to enter setup");
-                }
-                _ = evt_rx.recv() => {
-                    log::info!("Received event to enter setup");
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        });
-
-        {
-            let mut setting = setting.lock().unwrap();
-            if setting.0.background_gif.1 {
-                config_ui.set_info("Testing background GIF...".to_string());
-                config_ui.draw(framebuffer.as_mut())?;
-                framebuffer.flush()?;
-
-                let mut new_gif = Vec::new();
-                std::mem::swap(&mut setting.0.background_gif.0, &mut new_gif);
-
-                crate::ui::display_gif(framebuffer.as_mut(), &new_gif).unwrap();
-                log::info!("Background GIF set from NVS");
-
-                config_ui.set_info("Background GIF set OK".to_string());
-                config_ui.draw(framebuffer.as_mut())?;
-                framebuffer.flush()?;
-
-                setting
-                    .1
-                    .set_blob("background_gif", &new_gif)
-                    .map_err(|e| log::error!("Failed to save background GIF to NVS: {:?}", e))
-                    .unwrap();
-                log::info!("Background GIF saved to NVS");
-            }
-
-            if setting.0.avatar_gif.1 {
-                if setting.0.avatar_gif.0.is_empty() {
-                    config_ui.set_info("Clearing avatar GIF to default.".to_string());
-                    config_ui.draw(framebuffer.as_mut())?;
-                    framebuffer.flush()?;
-
-                    setting
-                        .1
-                        .remove("avatar_gif")
-                        .map_err(|e| log::error!("Failed to clear avatar GIF from NVS: {:?}", e))
-                        .unwrap();
-                } else {
-                    config_ui.set_info("Testing avatar GIF...".to_string());
-                    config_ui.draw(framebuffer.as_mut())?;
-                    framebuffer.flush()?;
-
-                    let mut new_gif = Vec::new();
-                    std::mem::swap(&mut setting.0.avatar_gif.0, &mut new_gif);
-
-                    crate::ui::display_gif(framebuffer.as_mut(), &new_gif).unwrap();
-                    log::info!("Avatar GIF set from NVS");
-
-                    config_ui.set_info("Avatar GIF set OK".to_string());
-                    config_ui.draw(framebuffer.as_mut())?;
-                    framebuffer.flush()?;
-
-                    setting
-                        .1
-                        .set_blob("avatar_gif", &new_gif)
-                        .map_err(|e| log::error!("Failed to save avatar GIF to NVS: {:?}", e))
-                        .unwrap();
-                    log::info!("Avatar GIF saved to NVS");
-                }
-            }
-        }
-
-        unsafe { esp_idf_svc::sys::esp_restart() }
-    }
-
-    {
-        let s = setting.lock().unwrap();
-        unsafe {
-            audio::AFE_LINEAR_GAIN = s.0.afe_linear_gain;
-            audio::AGC_TARGET_LEVEL_DBFS = s.0.agc_target_level_dbfs;
-            audio::AGC_COMPRESSION_GAIN_DB = s.0.agc_compression_gain_db;
-        }
-    }
-
-    chat_ui.set_state("Connecting to wifi...".to_string());
-    chat_ui.render_to_target(framebuffer.as_mut())?;
     framebuffer.flush()?;
 
     let (ssid_clone, pass_clone) = { let s = setting.lock().unwrap(); (s.0.ssid.clone(), s.0.pass.clone()) };
@@ -485,14 +326,24 @@ fn main() -> anyhow::Result<()> {
         chat_ui.render_to_target(framebuffer.as_mut())?;
         framebuffer.flush()?;
 
-        b.block_on(button.wait_for_falling_edge()).unwrap();
-        setting.lock().unwrap().1.set_u8("state", 1).unwrap();
-        unsafe { esp_idf_svc::sys::esp_restart() }
+        #[cfg(feature = "esp32s3cam")]
+        {
+            b.block_on(button.wait_for_falling_edge()).unwrap();
+            setting.lock().unwrap().1.set_u8("state", 1).unwrap();
+            unsafe { esp_idf_svc::sys::esp_restart() }
+        }
+        #[cfg(not(feature = "esp32s3cam"))]
+        {
+            // No local button available: set setup state and reboot immediately
+            setting.lock().unwrap().1.set_u8("state", 1).unwrap();
+            unsafe { esp_idf_svc::sys::esp_restart() }
+        }
     }
 
     let wifi = _wifi.unwrap();
-    log_heap();
 
+    // compute device id from WiFi MAC and ensure BLE is started so user can
+    // always configure via BLE if HTTP or WiFi are unavailable
     let mac = wifi.sta_netif().get_mac().unwrap();
     let dev_id = format!(
         "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -500,8 +351,335 @@ fn main() -> anyhow::Result<()> {
     );
 
     if !bt_started {
-        bt::bt(&dev_id, setting.clone(), evt_tx.clone()).unwrap();
-        bt_started = true;
+        match bt::bt(&dev_id, setting.clone(), evt_tx.clone()) {
+            Ok(()) => {
+                bt_started = true;
+                log::info!("BLE server started (device id: {})", dev_id);
+            }
+            Err(e) => log::error!("Failed to start BLE server: {:?}", e),
+        }
+    }
+
+    // Start a lightweight HTTP settings server (port 80) so users can configure
+    // the device via web UI without using BLE. Runs in its own thread with a
+    // tiny Tokio runtime.
+    {
+        let setting_clone = setting.clone();
+        let evt_tx_clone = evt_tx.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("http_server".to_string())
+            .stack_size(32 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build http server runtime");
+
+                rt.block_on(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let listener = match tokio::net::TcpListener::bind("0.0.0.0:80").await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            log::error!("HTTP server bind failed: {:?}", e);
+                            return;
+                        }
+                    };
+                    log::info!("HTTP settings server listening on 0.0.0.0:80");
+
+                    loop {
+                        let (mut socket, addr) = match listener.accept().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!("HTTP accept error: {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        let sc = setting_clone.clone();
+                        let evt_tx_conn = evt_tx_clone.clone();
+                        tokio::spawn(async move {
+                            let mut header_buf = [0u8; 8192];
+                            let mut read_bytes = 0usize;
+                            // read until header end or buffer full
+                            loop {
+                                match socket.read(&mut header_buf[read_bytes..]).await {
+                                    Ok(0) => return, // closed
+                                    Ok(n) => {
+                                        read_bytes += n;
+                                        if read_bytes >= 4 && header_buf[..read_bytes].windows(4).any(|w| w == b"\r\n\r\n") {
+                                            break;
+                                        }
+                                        if read_bytes == header_buf.len() { break; }
+                                    }
+                                    Err(_) => return,
+                                }
+                            }
+
+                            let header_str = String::from_utf8_lossy(&header_buf[..read_bytes]).to_string();
+                            let header_end = header_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(read_bytes);
+
+                            // parse request line
+                            let mut lines = header_str.split("\r\n");
+                            let req_line = lines.next().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("");
+                            let path = parts.next().unwrap_or("/");
+
+                            // parse headers for content-length
+                            let mut content_length: usize = 0;
+                            for line in lines {
+                                if line.is_empty() { break; }
+                                if let Some(rest) = line.strip_prefix("Content-Length:") {
+                                    content_length = rest.trim().parse().unwrap_or(0);
+                                }
+                            }
+
+                            // read body if any
+                            let mut body = Vec::new();
+                            if read_bytes > header_end {
+                                body.extend_from_slice(&header_buf[header_end..read_bytes]);
+                            }
+                            while body.len() < content_length {
+                                let mut tmp = vec![0u8; 1024];
+                                match socket.read(&mut tmp).await {
+                                    Ok(0) => break,
+                                    Ok(n) => body.extend_from_slice(&tmp[..n]),
+                                    Err(_) => break,
+                                }
+                            }
+
+                            // Simple routing
+                            if method == "GET" && (path == "/" || path == "/setup") {
+                                // Minimal setup page (JS uses fetch to the JSON endpoints)
+                                let html = r#"<!doctype html>
+<html>
+<head><meta charset='utf-8'><title>EchoKit Setup</title></head>
+<body>
+<h2>EchoKit Settings (HTTP)</h2>
+<div id='status'></div>
+<form id='settingsForm'>
+SSID: <input id='ssid' /><br/>
+PASS: <input id='pass' type='password' /><br/>
+Server URL: <input id='server' /><br/>
+MADCTL: <input id='madctl' placeholder='0x36' /><button type='button' id='applyMad'>Apply</button><br/>
+GAP X: <input id='gapx' type='number' value='0' /> Y: <input id='gapy' type='number' value='0' /><button type='button' id='applyGap'>Apply GAP</button><br/>
+Rotate: <input id='rot' type='number' min='0' max='3' value='0' /><button type='button' id='applyRot'>Apply</button><br/>
+<button id='saveSettings' type='button'>Save SSID/PASS/Server</button>
+</form>
+<script>
+async function load() {
+  const r = await fetch('/api/settings');
+  const json = await r.json();
+  document.getElementById('ssid').value = json.ssid || '';
+  document.getElementById('pass').value = json.pass || '';
+  document.getElementById('server').value = json.server_url || '';
+  document.getElementById('madctl').value = json.madctl_hex || '';
+  document.getElementById('gapx').value = json.gap_x || 0;
+  document.getElementById('gapy').value = json.gap_y || 0;
+  document.getElementById('rot').value = json.disp_rot || 0;
+}
+document.getElementById('applyMad').addEventListener('click', async () => {
+  const v = document.getElementById('madctl').value.trim();
+  await fetch('/api/set/madctl', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({madctl:v})});
+  alert('MADCTL send');
+});
+document.getElementById('applyGap').addEventListener('click', async () => {
+  const x = parseInt(document.getElementById('gapx').value) || 0;
+  const y = parseInt(document.getElementById('gapy').value) || 0;
+  await fetch('/api/set/gap', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({x:x,y:y})});
+  alert('GAP send');
+});
+document.getElementById('applyRot').addEventListener('click', async () => {
+  const r = parseInt(document.getElementById('rot').value) || 0;
+  await fetch('/api/set/rotate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({rot:r})});
+  alert('Rotate send');
+});
+document.getElementById('saveSettings').addEventListener('click', async () => {
+  const ssid = document.getElementById('ssid').value || '';
+  const pass = document.getElementById('pass').value || '';
+  const server = document.getElementById('server').value || '';
+  await fetch('/api/set/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid:ssid, pass:pass, server_url:server})});
+  alert('Settings saved (may require reboot to apply)');
+});
+load();
+</script>
+</body>
+</html>"#;
+
+                                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}", html.len(), html);
+                                let _ = socket.write_all(resp.as_bytes()).await;
+                                return;
+                            }
+
+                            if method == "GET" && path == "/api/settings" {
+                                // Acquire the lock, clone needed fields, then drop the lock
+                                let (ssid, pass, server_url, madctl, gap_x, gap_y) = {
+                                    let s = sc.lock().unwrap();
+                                    (
+                                        s.0.ssid.clone(),
+                                        s.0.pass.clone(),
+                                        s.0.server_url.clone(),
+                                        s.1.get_u8("madctl").ok().flatten(),
+                                        s.1.get_i32("gap_x").ok().flatten().unwrap_or(0),
+                                        s.1.get_i32("gap_y").ok().flatten().unwrap_or(0),
+                                    )
+                                };
+
+                                let rot_state = {
+                                    #[cfg(feature = "esp32s3cam")]
+                                    { crate::boards::esp32s3cam::get_rotation_state() }
+                                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                                    { crate::boards::base::get_rotation_state() }
+                                    #[cfg(not(any(feature = "esp32s3cam", all(feature = "boards", not(feature = "_no_default")))))]
+                                    { 0u8 }
+                                };
+
+                                let resp_json = serde_json::json!({
+                                    "ssid": ssid,
+                                    "pass": pass,
+                                    "server_url": server_url,
+                                    "madctl": madctl,
+                                    "madctl_hex": madctl.map(|m| format!("0x{:02X}", m)),
+                                    "gap_x": gap_x,
+                                    "gap_y": gap_y,
+                                    "disp_rot": rot_state
+                                });
+                                let body = serde_json::to_string(&resp_json).unwrap_or_else(|_| "{}".to_string());
+                                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                                let _ = socket.write_all(resp.as_bytes()).await;
+                                return;
+                            }
+
+                            if method == "POST" && path.starts_with("/api/set/") {
+                                let body_text = String::from_utf8_lossy(&body).to_string();
+                                // parse JSON payload if possible
+                                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+
+                                match path {
+                                    "/api/set/madctl" => {
+                                        if let Ok(json) = parsed {
+                                            if let Some(v) = json.get("madctl") {
+                                                if let Some(s) = v.as_str() {
+                                                    let s_trim = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+                                                    if let Ok(val) = u8::from_str_radix(s_trim, 16) {
+                                                        // apply to board and save to NVS
+                                                        #[cfg(feature = "esp32s3cam")]
+                                                        match crate::boards::esp32s3cam::set_madctl(val) {
+                                                            Ok(()) => {},
+                                                            Err(e) => log::error!("Failed to set MADCTL (esp32s3cam): {:?}", e),
+                                                        }
+                                                        #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                                                        match crate::boards::base::set_madctl(val) {
+                                                            Ok(()) => {},
+                                                            Err(e) => log::error!("Failed to set MADCTL (base): {:?}", e),
+                                                        }
+
+                                                        let mut s = sc.lock().unwrap();
+                                                        if let Err(e) = s.1.set_u8("madctl", val) {
+                                                            log::error!("Failed to save MADCTL to NVS: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "/api/set/gap" => {
+                                        if let Ok(json) = parsed {
+                                            let x = json.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                            let y = json.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                                            #[cfg(feature = "esp32s3cam")]
+                                            match crate::boards::esp32s3cam::set_gap(x, y) {
+                                                Ok(()) => {},
+                                                Err(e) => log::error!("Failed to set gap (esp32s3cam): {:?}", e),
+                                            }
+                                            #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                                            match crate::boards::base::set_gap(x, y) {
+                                                Ok(()) => {},
+                                                Err(e) => log::error!("Failed to set gap (base): {:?}", e),
+                                            }
+                                            let mut s = sc.lock().unwrap();
+                                            if let Err(e) = s.1.set_i32("gap_x", x) { log::error!("Failed to save gap_x: {:?}", e); }
+                                            if let Err(e) = s.1.set_i32("gap_y", y) { log::error!("Failed to save gap_y: {:?}", e); }
+                                        }
+                                    }
+                                    "/api/set/rotate" => {
+                                        if let Ok(json) = parsed {
+                                            if let Some(r) = json.get("rot").and_then(|v| v.as_i64()) {
+                                                let n = (r as u8) % 4;
+                                                #[cfg(feature = "esp32s3cam")]
+                                                if let Err(e) = crate::boards::esp32s3cam::set_rotation_state(n) { log::error!("Failed to set rotation (esp32s3cam): {:?}", e); }
+                                                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                                                if let Err(e) = crate::boards::base::set_rotation_state(n) { log::error!("Failed to set rotation (base): {:?}", e); }
+                                                {
+                                                    let mut s = sc.lock().unwrap();
+                                                    if let Err(e) = s.1.set_u8("disp_rot", n) {
+                                                        log::error!("Failed to save disp_rot: {:?}", e);
+                                                    }
+                                                }
+
+                                                // If no gap values stored and rotation==1, apply and persist a default
+                                                let need_default_gap = {
+                                                    let s = sc.lock().unwrap();
+                                                    let gx = s.1.get_i32("gap_x").ok().flatten();
+                                                    let gy = s.1.get_i32("gap_y").ok().flatten();
+                                                    gx.is_none() && gy.is_none() && n == 1
+                                                };
+                                                if need_default_gap {
+                                                    // Persist default logical gap (maps to applied Y=80 when swapped)
+                                                    {
+                                                        let mut s = sc.lock().unwrap();
+                                                        if let Err(e) = s.1.set_i32("gap_x", 80) { log::error!("Failed to save default gap_x: {:?}", e); }
+                                                        if let Err(e) = s.1.set_i32("gap_y", 0) { log::error!("Failed to save default gap_y: {:?}", e); }
+                                                    }
+                                                    #[cfg(feature = "esp32s3cam")]
+                                                    if let Err(e) = crate::boards::esp32s3cam::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
+                                                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
+                                                    if let Err(e) = crate::boards::base::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
+                                                }
+
+                                                // Notify main UI loop to re-render and flush with the new orientation
+                                                if let Err(e) = evt_tx_conn.send(crate::app::Event::Redraw).await {
+                                                    log::error!("Failed to enqueue Redraw event from HTTP handler: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "/api/set/settings" => {
+                                        if let Ok(json) = parsed {
+                                            let ssid = json.get("ssid").and_then(|v| v.as_str()).unwrap_or("");
+                                            let pass = json.get("pass").and_then(|v| v.as_str()).unwrap_or("");
+                                            let server_url = json.get("server_url").and_then(|v| v.as_str()).unwrap_or("");
+                                            let mut s = sc.lock().unwrap();
+                                            if let Err(e) = s.1.set_str("ssid", ssid) { log::error!("Failed to save ssid: {:?}", e); }
+                                            if let Err(e) = s.1.set_str("pass", pass) { log::error!("Failed to save pass: {:?}", e); }
+                                            if let Err(e) = s.1.set_str("server_url", server_url) { log::error!("Failed to save server_url: {:?}", e); }
+                                            // update in-memory copy too
+                                            s.0.ssid = ssid.to_string();
+                                            s.0.pass = pass.to_string();
+                                            s.0.server_url = server_url.to_string();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+
+                                let ok = "{\"ok\":true}";
+                                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", ok.len(), ok);
+                                let _ = socket.write_all(resp.as_bytes()).await;
+                                return;
+                            }
+
+                            // default: 404
+                            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                            let _ = socket.write_all(resp.as_bytes()).await;
+                        });
+                    }
+                });
+            });
+
+        if let Err(e) = spawn_result {
+            log::error!("Failed to spawn http server thread: {:?}", e);
+        }
     }
 
     chat_ui.set_state("Connecting to server...".to_string());
@@ -522,9 +700,18 @@ fn main() -> anyhow::Result<()> {
         log::info!("Failed to connect to server: {:?}", server.err());
         chat_ui.render_to_target(framebuffer.as_mut())?;
         framebuffer.flush()?;
-        b.block_on(button.wait_for_falling_edge()).unwrap();
-        setting.lock().unwrap().1.set_u8("state", 1).unwrap();
-        unsafe { esp_idf_svc::sys::esp_restart() }
+        #[cfg(feature = "esp32s3cam")]
+        {
+            b.block_on(button.wait_for_falling_edge()).unwrap();
+            setting.lock().unwrap().1.set_u8("state", 1).unwrap();
+            unsafe { esp_idf_svc::sys::esp_restart() }
+        }
+        #[cfg(not(feature = "esp32s3cam"))]
+        {
+            // No local button available: set setup state and reboot immediately
+            setting.lock().unwrap().1.set_u8("state", 1).unwrap();
+            unsafe { esp_idf_svc::sys::esp_restart() }
+        }
     }
 
     let server = server.unwrap();
@@ -642,40 +829,43 @@ fn main() -> anyhow::Result<()> {
 
     let ws_task = app::main_work(server, tx1, evt_rx, &mut framebuffer, &mut chat_ui);
 
-    b.spawn(async move {
-        loop {
-            let _ = button.wait_for_falling_edge().await;
-            log::info!("Button k0 pressed {:?}", button.get_level());
+    #[cfg(feature = "esp32s3cam")]
+    {
+        b.spawn(async move {
+            loop {
+                let _ = button.wait_for_falling_edge().await;
+                log::info!("Button k0 pressed {:?}", button.get_level());
 
-            let r = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                button.wait_for_rising_edge(),
-            )
-            .await;
-            match r {
-                Ok(_) => {
-                    if evt_tx
-                        .send(app::Event::Event(app::Event::K0))
-                        .await
-                        .is_err()
-                    {
-                        log::error!("Failed to send K0 event");
-                        break;
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    button.wait_for_rising_edge(),
+                )
+                .await;
+                match r {
+                    Ok(_) => {
+                        if evt_tx
+                            .send(app::Event::Event(app::Event::K0))
+                            .await
+                            .is_err()
+                        {
+                            log::error!("Failed to send K0 event");
+                            break;
+                        }
                     }
-                }
-                Err(_) => {
-                    if evt_tx
-                        .send(app::Event::Event(app::Event::K0_))
-                        .await
-                        .is_err()
-                    {
-                        log::error!("Failed to send K0 event");
-                        break;
+                    Err(_) => {
+                        if evt_tx
+                            .send(app::Event::Event(app::Event::K0_))
+                            .await
+                            .is_err()
+                        {
+                            log::error!("Failed to send K0 event");
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     b.block_on(async move {
         let r = ws_task.await;

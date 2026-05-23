@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
+clear
+date
+
 set -euo pipefail
-
 IMAGE=echokit-box-build:ubuntu22.04
-
 ##echo "Building Docker image $IMAGE..."
 ##docker build -t "$IMAGE" -f Dockerfile .
-
 echo "Running build inside container (install esp toolchain then build)..."
 
 # Named Docker volumes to persist caches between runs (cargo registry/git, rustup, target, espup, general cache)

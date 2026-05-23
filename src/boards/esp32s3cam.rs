@@ -271,7 +271,11 @@ pub fn flush_display(color_data: &[u8], x_start: i32, y_start: i32, x_end: i32, 
     unsafe {
         use esp_idf_svc::sys::*;
 
-        // Basic validation: ensure rectangle is valid
+        // Basic validation: ensure rectangle is valid and panel exists
+        if ESP_LCD_PANEL_HANDLE.is_null() {
+            ::log::warn!("flush_display: panel handle is null");
+            return ESP_ERR_INVALID_ARG;
+        }
         if x_start >= x_end || y_start >= y_end {
             ::log::warn!(
                 "flush_display invalid rectangle: x_start={} x_end={} y_start={} y_end={}",
@@ -285,41 +289,71 @@ pub fn flush_display(color_data: &[u8], x_start: i32, y_start: i32, x_end: i32, 
 
         let width = (x_end - x_start) as usize;
         let height = (y_end - y_start) as usize;
-        let row_bytes = width * std::mem::size_of::<u16>();
+        let bytes_per_pixel = std::mem::size_of::<u16>();
+        let row_bytes = width * bytes_per_pixel;
 
-        // Allocate DMA-capable temporary buffer for a single row
-        let dma_ptr = heap_caps_malloc(row_bytes, MALLOC_CAP_DMA) as *mut u8;
+        // Use a moderate chunk size (match common C driver heuristics)
+        let chunk_pixels = std::cmp::min(80usize, width);
+        let chunk_bytes = chunk_pixels * bytes_per_pixel;
+
+        // Allocate DMA-capable temporary buffer for one chunk
+        let dma_ptr = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA) as *mut u8;
         if dma_ptr.is_null() {
-            ::log::warn!("flush_display: failed to allocate DMA buffer ({} bytes)", row_bytes);
+            ::log::warn!("flush_display: failed to allocate DMA buffer ({} bytes)", chunk_bytes);
             return ESP_ERR_NO_MEM;
         }
 
         let mut last_e: i32 = 0;
         for row in 0..height {
-            let src_offset = row * row_bytes;
-            std::ptr::copy_nonoverlapping(
-                color_data.as_ptr().add(src_offset),
-                dma_ptr.add(0),
-                row_bytes,
-            );
-
+            let row_ptr = color_data.as_ptr().add(row * row_bytes);
             let y0 = y_start + row as i32;
             let y1 = y0 + 1;
 
-            let e = esp_lcd_panel_draw_bitmap(
-                ESP_LCD_PANEL_HANDLE,
-                x_start,
-                y0,
-                x_end,
-                y1,
-                dma_ptr.cast(),
-            );
-            if e != 0 {
-                // Log coordinates and rotation to help diagnose ESP_ERR_INVALID_ARG (258)
-                let rot = get_rotation_state();
-                ::log::warn!("flush_display draw_bitmap error at row {}: {} - coords x_start={}, y0={}, x_end={}, y1={}, width={}, height={}, rot={}", row, e, x_start, y0, x_end, y1, width, height, rot);
+            let mut offset_pixels = 0usize;
+            while offset_pixels < width {
+                let cur_pixels = std::cmp::min(chunk_pixels, width - offset_pixels);
+                let src_offset = offset_pixels * bytes_per_pixel;
+
+                std::ptr::copy_nonoverlapping(row_ptr.add(src_offset), dma_ptr, cur_pixels * bytes_per_pixel);
+
+                let x0 = x_start + offset_pixels as i32;
+                let x1 = x0 + cur_pixels as i32;
+
+                let e = esp_lcd_panel_draw_bitmap(
+                    ESP_LCD_PANEL_HANDLE,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    dma_ptr.cast(),
+                );
+                if e != 0 {
+                    // Log coordinates and rotation to help diagnose ESP_ERR_INVALID_ARG (258)
+                    let rot = get_rotation_state();
+                    ::log::warn!("flush_display draw_bitmap error at row {} x_offset {}: {} - coords x_start={}, y0={}, x_end={}, y1={}, chunk_pixels={}, total_width={}, rot={}", row, offset_pixels, e, x0, y0, x1, y1, cur_pixels, width, rot);
+
+                    if e == ESP_ERR_INVALID_ARG {
+                        let fallback = esp_lcd_panel_draw_bitmap(
+                            ESP_LCD_PANEL_HANDLE,
+                            x0,
+                            y0,
+                            x1 - 1,
+                            y1 - 1,
+                            dma_ptr.cast(),
+                        );
+                        if fallback == 0 {
+                            ::log::info!("flush_display: fallback draw succeeded with inclusive-end adjustment");
+                            last_e = fallback;
+                            offset_pixels += cur_pixels;
+                            continue;
+                        } else {
+                            ::log::warn!("flush_display: fallback draw also failed: {}", fallback);
+                        }
+                    }
+                }
+                last_e = e;
+                offset_pixels += cur_pixels;
             }
-            last_e = e;
         }
 
         heap_caps_free(dma_ptr.cast());

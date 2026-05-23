@@ -6,7 +6,6 @@ const SERVICE_ID: BleUuid = uuid128!("623fa3e2-631b-4f8f-a6e7-a7b09c03e7e0");
 const SSID_ID: BleUuid = uuid128!("1fda4d6e-2f14-42b0-96fa-453bed238375");
 const PASS_ID: BleUuid = uuid128!("a987ab18-a940-421a-a1d7-b94ee22bccbe");
 const SERVER_URL_ID: BleUuid = uuid128!("cef520a9-bcb5-4fc6-87f7-82804eee2b20");
-const OTA_ID: BleUuid = uuid128!("a0b1c2d3-e4f5-47ab-89cd-0123456789ab");
 const BACKGROUND_GIF_ID: BleUuid = uuid128!("d1f3b2c4-5e6f-4a7b-8c9d-0e1f2a3b4c5d");
 const AVATAR_GIF_ID: BleUuid = uuid128!("e2f4c3b5-6d7e-4f8a-9b0c-1f2e3d4c5b6a");
 const RESET_ID: BleUuid = uuid128!("f0e1d2c3-b4a5-6789-0abc-def123456789");
@@ -24,15 +23,10 @@ pub fn bt(
 ) -> anyhow::Result<()> {
     let ble_device = esp32_nimble::BLEDevice::take();
     let ble_advertising = ble_device.get_advertising();
-
     let server = ble_device.get_server();
     server.on_connect(|server, desc| {
         log::info!("Client connected: {:?}", desc);
-
-        server
-            .update_conn_params(desc.conn_handle(), 24, 48, 0, 60)
-            .unwrap();
-
+        server.update_conn_params(desc.conn_handle(), 24, 48, 0, 60).unwrap();
         if server.connected_count() < (esp_idf_svc::sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as _) {
             log::info!("Multi-connect support: start advertising");
             ble_advertising.lock().start().unwrap();
@@ -48,11 +42,8 @@ pub fn bt(
     let setting1 = setting.clone();
     let setting2 = setting.clone();
 
-    let ssid_characteristic = service
-        .lock()
-        .create_characteristic(SSID_ID, NimbleProperties::READ | NimbleProperties::WRITE);
-    ssid_characteristic
-        .lock()
+    let ssid_characteristic = service.lock().create_characteristic(SSID_ID, NimbleProperties::READ | NimbleProperties::WRITE);
+    ssid_characteristic.lock()
         .on_read(move |c, _| {
             log::info!("Read from SSID characteristic");
             let setting = setting1.lock().unwrap();
@@ -79,11 +70,8 @@ pub fn bt(
 
     let setting1 = setting.clone();
     let setting2 = setting.clone();
-    let pass_characteristic = service
-        .lock()
-        .create_characteristic(PASS_ID, NimbleProperties::READ | NimbleProperties::WRITE);
-    pass_characteristic
-        .lock()
+    let pass_characteristic = service.lock().create_characteristic(PASS_ID, NimbleProperties::READ | NimbleProperties::WRITE);
+    pass_characteristic.lock()
         .on_read(move |c, _| {
             log::info!("Read from pass characteristic");
             let setting = setting1.lock().unwrap();
@@ -113,13 +101,11 @@ pub fn bt(
     let setting_gif = setting.clone();
     let setting_avatar = setting.clone();
     let setting_afe = setting.clone(); // Extra clone for AFE characteristics
-
     let server_url_characteristic = service.lock().create_characteristic(
         SERVER_URL_ID,
         NimbleProperties::READ | NimbleProperties::WRITE,
     );
-    server_url_characteristic
-        .lock()
+    server_url_characteristic.lock()
         .on_read(move |c, _| {
             log::info!("Read from server URL characteristic");
             let s = setting_server_url_read.lock().unwrap();
@@ -144,30 +130,11 @@ pub fn bt(
             }
         });
 
-    // OTA via URL characteristic: write an HTTPS URL to trigger OTA update
-    let ota_evt_tx = evt_tx.clone();
-    let ota_characteristic = service
-        .lock()
-        .create_characteristic(OTA_ID, NimbleProperties::WRITE);
-    ota_characteristic.lock().on_write(move |args| {
-        if let Ok(url) = String::from_utf8(args.recv_data().to_vec()) {
-            log::info!("OTA requested via BLE: {}", url);
-            if let Err(e) = ota_evt_tx.blocking_send(crate::app::Event::Ota(url.clone())) {
-                log::error!("Failed to enqueue OTA request: {:?}", e);
-                args.reject();
-            }
-        } else {
-            log::error!("Failed to parse OTA URL from bytes.");
-            args.reject();
-        }
-    });
+    // OTA characteristic removed
 
-    let background_gif_characteristic = service
-        .lock()
-        .create_characteristic(BACKGROUND_GIF_ID, NimbleProperties::WRITE);
+    let background_gif_characteristic = service.lock().create_characteristic(BACKGROUND_GIF_ID, NimbleProperties::WRITE);
     background_gif_characteristic.lock().on_write(move |args| {
         let gif_chunk = args.recv_data();
-
         if gif_chunk.len() <= 1024 * 1024 && gif_chunk.len() > 0 {
             log::info!("New background GIF received, size: {}", gif_chunk.len());
             let mut setting = setting_gif.lock().unwrap();
@@ -186,12 +153,10 @@ pub fn bt(
         }
     });
 
-    let avatar_gif_characteristic = service
-        .lock()
-        .create_characteristic(AVATAR_GIF_ID, NimbleProperties::WRITE);
+    let avatar_gif_characteristic = service.lock().create_characteristic(AVATAR_GIF_ID, NimbleProperties::WRITE);
     avatar_gif_characteristic.lock().on_write(move |args| {
-        let gif_chunk = args.recv_data();
-        if gif_chunk.len() == 0 {
+            let gif_chunk = args.recv_data();
+            if gif_chunk.len() == 0 {
             log::info!("Clearing avatar GIF to default.");
             let mut setting = setting_avatar.lock().unwrap();
             setting.0.avatar_gif.0.clear();
@@ -208,8 +173,8 @@ pub fn bt(
                 setting.0.avatar_gif.1 = true; // Mark as valid
             }
 
-            if setting.0.avatar_gif.0.len() > 128 * 1024 {
-                log::warn!("Avatar GIF size exceeds 128KB, resetting to default.");
+            if setting.0.avatar_gif.0.len() > 1024 * 1024 {
+                log::warn!("Avatar GIF size exceeds 1024KB, resetting to default.");
                 setting.0.avatar_gif.0.clear();
                 setting.0.avatar_gif.1 = false;
                 args.reject();
@@ -240,9 +205,7 @@ pub fn bt(
 
     // Rotation characteristic: write 'LEFT' or 'RIGHT' to rotate display 90°,
     // or write an ASCII number 0..3 to set rotation state directly.
-    let rotate_characteristic = service
-        .lock()
-        .create_characteristic(ROTATE_ID, NimbleProperties::WRITE);
+    let rotate_characteristic = service.lock().create_characteristic(ROTATE_ID, NimbleProperties::WRITE);
     rotate_characteristic.lock().on_write(move |args| {
         let data = args.recv_data();
         let mut rotated = false;
@@ -356,9 +319,7 @@ pub fn bt(
     // MADCTL setter: write a single byte (raw) or ASCII hex (e.g. "0x36") to try different MADCTL values
     let evt_tx_madctl = evt_tx.clone();
     let setting_madctl = setting.clone();
-    let madctl_characteristic = service
-        .lock()
-        .create_characteristic(MADCTL_ID, NimbleProperties::WRITE);
+    let madctl_characteristic = service.lock().create_characteristic(MADCTL_ID, NimbleProperties::WRITE);
     madctl_characteristic.lock().on_write(move |args| {
         let data = args.recv_data();
         // Accept raw single byte or ASCII hex
