@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::net::ToSocketAddrs;
 
 // embedded_graphics imports not needed in main.rs
 use embedded_graphics::prelude::RgbColor;
@@ -209,6 +210,9 @@ fn main() -> anyhow::Result<()> {
     // Small current-thread runtime used by main for blocking async helpers (ws, button waits)
     let b = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        // Increase default thread stack size for blocking thread pool to avoid
+        // small-stack crashes when tokio spawns blocking DNS/IO threads on ESP32.
+        .thread_stack_size(128 * 1024)
         .build()
         .expect("failed to build main current-thread runtime");
 
@@ -372,6 +376,8 @@ fn main() -> anyhow::Result<()> {
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
+                    // Use slightly smaller stack for http server runtime threads
+                    .thread_stack_size(64 * 1024)
                     .build()
                     .expect("failed to build http server runtime");
 
@@ -630,7 +636,7 @@ load();
                                                     {
                                                         let mut s = sc.lock().unwrap();
                                                         if let Err(e) = s.1.set_i32("gap_x", 80) { log::error!("Failed to save default gap_x: {:?}", e); }
-                                                        if let Err(e) = s.1.set_i32("gap_y", 0) { log::error!("Failed to save default gap_y: {:?}", e); }
+                                                        if let Err(e) = s.1.set_i32("gap_y", 5) { log::error!("Failed to save default gap_y: {:?}", e); }
                                                     }
                                                     #[cfg(feature = "esp32s3cam")]
                                                     if let Err(e) = crate::boards::esp32s3cam::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
@@ -695,7 +701,63 @@ load();
         "Please check your server URL: {}\nPress K0 to open settings",
         server_url_clone
     ));
-    let server = b.block_on(ws::Server::new(dev_id, server_url_clone));
+
+    // Resolve hostname -> IP synchronously to avoid Tokio spawning blocking resolver threads
+    // (which can fail on constrained systems by creating pthreads).
+    let server_url_resolved = (|| {
+        // Simple parse for ws:// or wss://
+        let url = server_url_clone.as_str();
+        if let Some(rest) = url.strip_prefix("ws://") {
+            let scheme = "ws";
+            let default_port = 80u16;
+            let slash_pos = rest.find('/').unwrap_or(rest.len());
+            let host_port = &rest[..slash_pos];
+            let path = &rest[slash_pos..];
+            let (host, port) = if let Some(colon_pos) = host_port.rfind(':') {
+                let h = &host_port[..colon_pos];
+                if let Ok(p) = host_port[colon_pos+1..].parse::<u16>() { (h, p) } else { (host_port, default_port) }
+            } else {
+                (host_port, default_port)
+            };
+            match (host, port).to_socket_addrs() {
+                Ok(mut iter) => {
+                    if let Some(sock) = iter.next() {
+                        let ip = sock.ip();
+                        let port = sock.port();
+                        return format!("{}://{}:{}{}", scheme, ip, port, path);
+                    }
+                }
+                Err(_) => {}
+            }
+            return server_url_clone.clone();
+        } else if let Some(rest) = server_url_clone.as_str().strip_prefix("wss://") {
+            let scheme = "wss";
+            let default_port = 443u16;
+            let slash_pos = rest.find('/').unwrap_or(rest.len());
+            let host_port = &rest[..slash_pos];
+            let path = &rest[slash_pos..];
+            let (host, port) = if let Some(colon_pos) = host_port.rfind(':') {
+                let h = &host_port[..colon_pos];
+                if let Ok(p) = host_port[colon_pos+1..].parse::<u16>() { (h, p) } else { (host_port, default_port) }
+            } else {
+                (host_port, default_port)
+            };
+            match (host, port).to_socket_addrs() {
+                Ok(mut iter) => {
+                    if let Some(sock) = iter.next() {
+                        let ip = sock.ip();
+                        let port = sock.port();
+                        return format!("{}://{}:{}{}", scheme, ip, port, path);
+                    }
+                }
+                Err(_) => {}
+            }
+            return server_url_clone.clone();
+        }
+        server_url_clone.clone()
+    })();
+
+    let server = b.block_on(ws::Server::new(dev_id, server_url_resolved));
     if server.is_err() {
         log::info!("Failed to connect to server: {:?}", server.err());
         chat_ui.render_to_target(framebuffer.as_mut())?;
