@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::net::ToSocketAddrs;
+use rand::RngCore;
 
 // embedded_graphics imports not needed in main.rs
 use embedded_graphics::prelude::RgbColor;
@@ -176,15 +177,7 @@ fn main() -> anyhow::Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
     let peripherals = esp_idf_svc::hal::prelude::Peripherals::take().unwrap();
 
-    // Early diagnostic: force backlight GPIO48 HIGH to power panel during startup.
-
-        log::info!("Early backlight diagnostic: forcing GPIO48 HIGH");
-        unsafe {
-            use esp_idf_svc::sys::*;
-            let bl_num = 48 as i32;
-            let _ = esp!(gpio_set_direction(bl_num, gpio_mode_t_GPIO_MODE_OUTPUT));
-            let _ = esp!(gpio_set_level(bl_num, 1));
-        }
+    // (Display diagnostic removed)
     let sysloop = EspSystemEventLoop::take()?;
     let _fs = esp_idf_svc::io::vfs::MountedEventfs::mount(20)?;
     let partition = esp_idf_svc::nvs::EspDefaultNvsPartition::take()?;
@@ -286,16 +279,6 @@ fn main() -> anyhow::Result<()> {
             #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
             if let Err(e) = crate::boards::base::set_gap(gx, gy) { log::error!("Failed to restore gap: {:?}", e); }
             log::info!("Restored GAP from NVS: x={}, y={}", gx, gy);
-        } else if let Some(rot) = saved_rot {
-            // If no explicit gap stored but rotation is 1 we prefer an initial adjustment
-            if rot == 1 {
-                // For rotation==1 apply a default gap mapping that yields a visible Y offset on rotated panel
-                #[cfg(feature = "esp32s3cam")]
-                if let Err(e) = crate::boards::esp32s3cam::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
-                #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
-                if let Err(e) = crate::boards::base::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
-                log::info!("Applied default GAP for rot=1: x=80, y=0 (maps to Y=80 when swapped)");
-            }
         }
 
         if let Some(rot) = saved_rot {
@@ -319,6 +302,23 @@ fn main() -> anyhow::Result<()> {
 
     // Track whether BLE server has been started
     let mut bt_started = false;
+
+    // Start BLE early so users can configure the device via BLE on first boot
+    // even if Wi‑Fi is not yet configured. Use a temporary device id derived
+    // from 6 random bytes if we cannot obtain the Wi‑Fi MAC yet.
+    {
+        let mut rnd = rand::thread_rng();
+        let mut idb = [0u8; 6];
+        rnd.fill_bytes(&mut idb);
+        let early_dev_id = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", idb[0], idb[1], idb[2], idb[3], idb[4], idb[5]);
+        match bt::bt(&early_dev_id, setting.clone(), evt_tx.clone()) {
+            Ok(()) => {
+                bt_started = true;
+                log::info!("BLE server started early (dev id: {})", early_dev_id);
+            }
+            Err(e) => log::error!("Failed to start BLE early: {:?}", e),
+        }
+    }
 
     framebuffer.flush()?;
 
@@ -366,7 +366,9 @@ fn main() -> anyhow::Result<()> {
 
     // Start a lightweight HTTP settings server (port 80) so users can configure
     // the device via web UI without using BLE. Runs in its own thread with a
-    // tiny Tokio runtime.
+    // tiny Tokio runtime. This server is optional and compiled only when the
+    // `http` feature is enabled.
+    #[cfg(feature = "http")]
     {
         let setting_clone = setting.clone();
         let evt_tx_clone = evt_tx.clone();
@@ -394,7 +396,7 @@ fn main() -> anyhow::Result<()> {
                     log::info!("HTTP settings server listening on 0.0.0.0:80");
 
                     loop {
-                        let (mut socket, addr) = match listener.accept().await {
+                        let (mut socket, _addr) = match listener.accept().await {
                             Ok(s) => s,
                             Err(e) => {
                                 log::warn!("HTTP accept error: {:?}", e);
@@ -558,7 +560,6 @@ load();
                             }
 
                             if method == "POST" && path.starts_with("/api/set/") {
-                                let body_text = String::from_utf8_lossy(&body).to_string();
                                 // parse JSON payload if possible
                                 let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
 
@@ -624,25 +625,7 @@ load();
                                                     }
                                                 }
 
-                                                // If no gap values stored and rotation==1, apply and persist a default
-                                                let need_default_gap = {
-                                                    let s = sc.lock().unwrap();
-                                                    let gx = s.1.get_i32("gap_x").ok().flatten();
-                                                    let gy = s.1.get_i32("gap_y").ok().flatten();
-                                                    gx.is_none() && gy.is_none() && n == 1
-                                                };
-                                                if need_default_gap {
-                                                    // Persist default logical gap (maps to applied Y=80 when swapped)
-                                                    {
-                                                        let mut s = sc.lock().unwrap();
-                                                        if let Err(e) = s.1.set_i32("gap_x", 80) { log::error!("Failed to save default gap_x: {:?}", e); }
-                                                        if let Err(e) = s.1.set_i32("gap_y", 5) { log::error!("Failed to save default gap_y: {:?}", e); }
-                                                    }
-                                                    #[cfg(feature = "esp32s3cam")]
-                                                    if let Err(e) = crate::boards::esp32s3cam::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
-                                                    #[cfg(all(not(feature = "esp32s3cam"), feature = "boards", not(feature = "_no_default")))]
-                                                    if let Err(e) = crate::boards::base::set_gap(80, 0) { log::error!("Failed to apply default gap for rot=1: {:?}", e); }
-                                                }
+                                                // No default gap is applied when changing rotation via HTTP.
 
                                                 // Notify main UI loop to re-render and flush with the new orientation
                                                 if let Err(e) = evt_tx_conn.send(crate::app::Event::Redraw).await {
@@ -686,6 +669,10 @@ load();
         if let Err(e) = spawn_result {
             log::error!("Failed to spawn http server thread: {:?}", e);
         }
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        log::info!("HTTP settings server disabled by configuration.");
     }
 
     chat_ui.set_state("Connecting to server...".to_string());

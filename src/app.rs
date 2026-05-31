@@ -365,8 +365,8 @@ pub async fn main_work<'d, const N: usize>(
                         .await?;
                     submit_state.audio_buffer = Vec::with_capacity(8192);
 
-                    if submit_state.submit_audio > 30.0 && !submit_state.got_asr_result {
-                        log::info!("No ASR result after 30s audio, ending request");
+                    if submit_state.submit_audio > 10.0 && !submit_state.got_asr_result {
+                        log::info!("No ASR result after 10s audio, ending request");
                         crate::audio::VAD_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
 
                         submit_state.clear();

@@ -115,8 +115,33 @@ async fn ws_manager(
                             })?;
                         }
                     }
+                } else if msg.is_text() {
+                    // Convert payload bytes to text and try to parse JSON ServerEvent
+                    let payload = msg.into_payload();
+                    let text = String::from_utf8_lossy(&payload).to_string();
+                    match serde_json::from_str::<crate::protocol::ServerEvent>(&text) {
+                        Ok(evt) => {
+                            tx.send(evt).await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to send event to channel: {}",
+                                    e
+                                )
+                            })?;
+                        }
+                        Err(_) => {
+                            // Not JSON ServerEvent — log at debug level and ignore
+                            log::debug!("WS text message not a ServerEvent JSON: {}", text);
+                        }
+                    }
+                    continue;
+                } else if msg.is_ping() || msg.is_pong() {
+                    // ignore control frames
+                    continue;
+                } else if msg.is_close() {
+                    log::info!("WebSocket closed by remote");
+                    return Ok(());
                 } else {
-                    log::error!("Unexpected non-binary WebSocket message received");
+                    log::warn!("Unexpected non-binary WebSocket message received (unknown type)");
                     continue;
                 }
             }

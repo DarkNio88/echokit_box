@@ -23,6 +23,7 @@ opt-level = "z"
 default = ["boards"]
 
 experimental = ["esp-idf-svc/experimental"]
+http = []
 
 boards = ["voice_interrupt"]
 _no_default = []
